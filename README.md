@@ -72,7 +72,6 @@
 2. Нажмите Ctrl+Shift+P - установка пакета vsix
 3. Выберите файл
 4. Закройте Cursor, откройте повторно
-5. Ctrl+J - откроется панель с доступной вкладкой 1C Platform Tools
 
 
 ## Настройка
@@ -102,6 +101,7 @@ project/
 ├── build/
 │   ├── ib/                 # Информационная база
 │   └── out/                # Собранные файлы
+│   └── commit/Commit.txt   # Файл куда пишем наши изменения
 ├── src/
 │   ├── cf/                 # Исходники конфигурации
 │   ├── cfe/                # Исходники расширений
@@ -117,6 +117,10 @@ project/
 - Все команды выполняются в терминале Cursor для видимости вывода
 - Параметр `--ibconnection` берется из `env.json` (секция `default['--ibconnection']`, по умолчанию `/F./build/ib`)
 - Пути в настройках задаются относительно корня проекта или абсолютно; при вызове платформы 1С расширение подставляет итоговые абсолютные пути
+- В каталог oscript_modules/ с проектом копируем содержимое из репозитория oscript_modules/v8runner
+- В файл Commit.txt пишем что поменяли, пример:
+    e:\DATA1C\BASE\src\cf\Catalogs\Подразделения\Ext\Predefined.xml
+    e:\DATA1C\BASE\src\cf\Documents\Сборка\Ext\ObjectModule.bsl
 
 ## ВАЖНО
 - за основу взят проект https://github.com/yellow-hammer/1c-platform-tools

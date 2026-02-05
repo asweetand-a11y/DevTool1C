@@ -2,7 +2,7 @@
   "name": "1c-platform-tools",
   "displayName": "1C Platform Tools",
   "description": "Расширение для Cursor с инструментами разработки для экосистемы 1С. Предоставляет удобный интерфейс для работы с проектами 1С, включая разбор обработок, отчетов и конфигураций.",
-  "version": "2.7.7",
+  "version": "2.7.8",
   "publisher": "whiterabbit",
   "repository": {
     "type": "",
