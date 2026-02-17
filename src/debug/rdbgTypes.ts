@@ -133,6 +133,8 @@ export interface ModuleBpInfoForRequest {
 	moduleIdString?: string;
 	/** Точки останова в этом модуле */
 	bpInfo: BreakpointInfoRdbg[];
+	/** Hash версии расширения (SHA1 Configuration.xml) — обязателен для ExtensionModule */
+	version?: string;
 }
 
 /** Запрос установки точек останова в RDBG. Формат 8.3.27: moduleType/moduleName (moduleInfo). */

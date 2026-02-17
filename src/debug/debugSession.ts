@@ -22,7 +22,7 @@ import { randomUUID } from 'node:crypto';
 import { getLastDbgsLaunch } from './dbgsLaunchInfo';
 import { format1cv8cCommandLine, launch1cv8c, resolvePlatformBin } from './launch1cv8c';
 import { getVariableNamesFromProcedureAtLine } from './bslProcedureVariables';
-import { getModuleInfoByPath, getModulePathByModuleIdStr, getModulePathByObjectProperty } from './metadataProvider';
+import { getExtensionVersionHash, getModuleInfoByPath, getModulePathByModuleIdStr, getModulePathByObjectProperty } from './metadataProvider';
 import { getDebugTimingConfig } from './debugTimingConfig';
 import { RdbgClient } from './rdbgClient';
 import {
@@ -964,13 +964,16 @@ export class OnecDebugSession extends DebugSession {
 				putExpressionResult: bp.logMessage ?? '',
 				continueExecution: !!bp.logMessage,
 			}));
+			const ext = moduleInfo.extension?.trim() ?? '';
+			const version = ext ? getExtensionVersionHash(root, ext) : undefined;
 			bpWorkspace.push({
-				extension: moduleInfo.extension,
+				extension: ext,
 				objectId: moduleInfo.objectId,
 				propertyId: moduleInfo.propertyId,
 				bslModuleType: moduleInfo.bslModuleType,
 				moduleIdString: moduleInfo.moduleIdString || undefined,
 				bpInfo: bpInfoRdbg,
+				...(version && { version }),
 			});
 		}
 

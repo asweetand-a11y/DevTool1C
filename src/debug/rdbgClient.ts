@@ -437,8 +437,8 @@ function buildAttachDebugUiBody(req: RdbgAttachDebugUiRequest): string {
 }
 
 /**
- * Формирует XML для setBreakpoints по формату обмена с сервером 1С: префиксы debugRDBGRequestResponse/debugBreakpoints,
- * id с objectID, propertyID, version без префикса; bpInfo — дочерние line и hitCount без обёртки breakpoint.
+ * Формирует XML для setBreakpoints по формату обмена с сервером 1С.
+ * Для расширений: type=ExtensionModule, extensionName, version (hash). Для основной конфигурации: type=ConfigModule.
  */
 function buildSetBreakpointsBody(req: RdbgSetBreakpointsRequest): string {
 	const q = 'debugRDBGRequestResponse';
@@ -446,8 +446,11 @@ function buildSetBreakpointsBody(req: RdbgSetBreakpointsRequest): string {
 	const parts: string[] = [];
 	for (const m of req.bpWorkspace) {
 		if (!m.objectId?.trim() || !m.propertyId?.trim()) continue;
-		const versionRaw = String(((m as unknown) as Record<string, unknown>).version ?? '');
-		const version = versionRaw.trim();
+		const ext = (m.extension ?? '').trim();
+		const isExtension = ext !== '';
+		const typeXml = `<type>${isExtension ? 'ExtensionModule' : 'ConfigModule'}</type>`;
+		const extNameXml = isExtension ? `<extensionName>${escapeXml(ext)}</extensionName>` : '';
+		const version = (m.version ?? '').trim();
 		const versionXml = version ? `<version>${escapeXml(version)}</version>` : '';
 		const bpInfoParts: string[] = [];
 		for (const bpItem of m.bpInfo) {
@@ -458,7 +461,7 @@ function buildSetBreakpointsBody(req: RdbgSetBreakpointsRequest): string {
 		if (bpInfoParts.length === 0) bpInfoParts.push(`<${bp}:line>0</${bp}:line><${bp}:hitCount>0</${bp}:hitCount>`);
 		parts.push(
 			`<${bp}:moduleBPInfo>` +
-			`<${bp}:id><objectID>${escapeXml(m.objectId)}</objectID><propertyID>${escapeXml(m.propertyId)}</propertyID>${versionXml}</${bp}:id>` +
+			`<${bp}:id>${typeXml}${extNameXml}<objectID>${escapeXml(m.objectId)}</objectID><propertyID>${escapeXml(m.propertyId)}</propertyID>${versionXml}</${bp}:id>` +
 			`<${bp}:bpInfo>${bpInfoParts.join('')}</${bp}:bpInfo>` +
 			`</${bp}:moduleBPInfo>`,
 		);

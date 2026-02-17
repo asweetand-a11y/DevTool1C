@@ -5,6 +5,7 @@
  * URL в setBreakpoints не передаём — только ExtensionName, ObjectId, PropertyId.
  */
 
+import * as crypto from 'node:crypto';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import type { DbModuleType, BslModuleTypeEnum } from './rdbgTypes';
@@ -394,6 +395,27 @@ export function getModulePathByModuleIdStr(workspaceRoot: string, moduleIdStr: s
 		.replace(/\bForm\b(?!\.)/i, 'Форма');
 	for (const info of cache.values()) {
 		if (info.moduleIdString === alt) return info.path;
+	}
+	return '';
+}
+
+/**
+ * Hash версии расширения для setBreakpoints (SHA1 от Configuration.xml).
+ * Используется при отладке модулей расширений — сервер требует version для ExtensionModule.
+ */
+export function getExtensionVersionHash(workspaceRoot: string, extensionName: string): string {
+	const ext = extensionName.trim();
+	if (!ext || !workspaceRoot) return '';
+	for (const base of [path.join(workspaceRoot, 'src', 'cfe'), path.join(workspaceRoot, 'cfe')]) {
+		const configPath = path.join(base, ext, 'Configuration.xml');
+		try {
+			if (fs.existsSync(configPath)) {
+				const content = fs.readFileSync(configPath, 'utf8');
+				return crypto.createHash('sha1').update(content, 'utf8').digest('hex');
+			}
+		} catch {
+			// ignore
+		}
 	}
 	return '';
 }
