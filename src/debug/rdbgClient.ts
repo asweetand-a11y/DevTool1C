@@ -45,6 +45,9 @@ import { NS, ResponseSchema, DbguiExtCmds } from './xdtoSchema';
 /** Кодировка запросов к серверу отладки 1С: при true — Windows-1251 (кириллица в evalExpr), иначе UTF-8. Ответы всегда декодируем как UTF-8 (имена/значения переменных в панели VARIABLES приходят в UTF-8). */
 const RDBG_REQUEST_WINDOWS_1251 = true;
 
+/** Таймаут для получения переменных (мс): calcWaitingTime в запросах evalLocalVariables/evalExpr, задержки между retry. */
+const VAR_FETCH_DELAY_MS = 25;
+
 function buildBaseRequestXml(base: RDbgBaseRequest): string {
 	return `<infoBaseAlias>${escapeXml(base.infoBaseAlias)}</infoBaseAlias><idOfDebuggerUI>${escapeXml(base.idOfDebuggerUi)}</idOfDebuggerUI>`;
 }
@@ -146,7 +149,7 @@ function buildEvalLocalVariablesRequestBody(
 		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
-		`<debugRDBGRequestResponse:calcWaitingTime>100</debugRDBGRequestResponse:calcWaitingTime>` +
+		`<debugRDBGRequestResponse:calcWaitingTime>${VAR_FETCH_DELAY_MS}</debugRDBGRequestResponse:calcWaitingTime>` +
 		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
 		exprBlock +
 		`</request>`;
@@ -180,7 +183,7 @@ function buildEvalExprRequestBody(
 		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
-		`<debugRDBGRequestResponse:calcWaitingTime>100</debugRDBGRequestResponse:calcWaitingTime>` +
+		`<debugRDBGRequestResponse:calcWaitingTime>${VAR_FETCH_DELAY_MS}</debugRDBGRequestResponse:calcWaitingTime>` +
 		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
 		exprBlock +
 		`</request>`;
@@ -232,7 +235,7 @@ function buildEvalLocalVariablesBatchRequestBody(
 		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
-		`<debugRDBGRequestResponse:calcWaitingTime>100</debugRDBGRequestResponse:calcWaitingTime>` +
+		`<debugRDBGRequestResponse:calcWaitingTime>${VAR_FETCH_DELAY_MS}</debugRDBGRequestResponse:calcWaitingTime>` +
 		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
 		exprBlocks.join('') +
 		`</request>`;
@@ -773,7 +776,7 @@ export class RdbgClient {
 	 * Вычисление выражения в контексте остановки (evalExpr). Формат по трафику Конфигуратора (default NS debugBaseData, префиксы, два idOfDebuggerUI, calcWaitingTime 100).
 	 */
 	/**
-	 * Вычисление выражения (evalExpr). При пустом теле ответа результат может прийти в ping (exprEvaluated); выполняем до 3 опросов ping с паузой 100 ms.
+	 * Вычисление выражения (evalExpr). При пустом теле ответа результат может прийти в ping (exprEvaluated) либо при повторном запросе — сервер иногда возвращает пустой ответ до готовности данных.
 	 */
 	async evalExpr(
 		base: RDbgBaseRequest,
@@ -782,12 +785,24 @@ export class RdbgClient {
 		frameIndex: number,
 	): Promise<EvalExprResult> {
 		const { body, expressionResultID } = buildEvalExprRequestBody(base, targetId, expression, frameIndex);
-		const xml = await this.postXml('evalExpr', body);
-		const parsed = parseEvalExprResult(xml);
-		const hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
+		let xml = await this.postXml('evalExpr', body);
+		let parsed = parseEvalExprResult(xml);
+		let hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
 		if (hasContent) return parsed;
-		for (let i = 0; i < 5; i++) {
-			if (i > 0) await new Promise((r) => setTimeout(r, 80));
+
+		// При пустом ответе — retry полного запроса (как variablesRequest): сервер может вернуть данные при повторной отправке
+		{
+			for (const delayMs of [VAR_FETCH_DELAY_MS, VAR_FETCH_DELAY_MS]) {
+				await new Promise((r) => setTimeout(r, delayMs));
+				xml = await this.postXml('evalExpr', body);
+				parsed = parseEvalExprResult(xml);
+				hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
+				if (hasContent) return parsed;
+			}
+		}
+
+		for (let i = 0; i < 4; i++) {
+			if (i > 0) await new Promise((r) => setTimeout(r, VAR_FETCH_DELAY_MS));
 			const pingResult = await this.pingDebugUIParams(base);
 			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
 			if (found) return found.result;
@@ -925,7 +940,7 @@ export class RdbgClient {
 		const xml = decoded.trim() ? decoded : raw;
 		const parsed = parseEvalLocalVariablesResult(xml);
 		if (parsed.variables.length > 0) return parsed;
-		for (let i = 0; i < 7; i++) {
+		for (let i = 0; i < 4; i++) {
 			// Сначала проверяем store — exprEvaluated мог прийти в pollPing
 			if (exprEvaluatedStore) {
 				const stored = exprEvaluatedStore.take(expressionResultID);
@@ -938,8 +953,8 @@ export class RdbgClient {
 					return { variables };
 				}
 			}
-			// Ждём только после первой итерации — если результат уже в ping, получим сразу
-			if (i > 0) await new Promise((r) => setTimeout(r, 80));
+			// Ждём только после первой итерации
+			if (i > 0) await new Promise((r) => setTimeout(r, VAR_FETCH_DELAY_MS));
 			const pingResult = await this.pingDebugUIParams(base);
 			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
 			if (found) {
@@ -992,7 +1007,7 @@ export class RdbgClient {
 				childrenByExpression[expandableExpressions[idx - 1]] = ev.result;
 			}
 		};
-		for (let poll = 0; poll < 7 && missingIds.size > 0; poll++) {
+		for (let poll = 0; poll < 4 && missingIds.size > 0; poll++) {
 			if (exprEvaluatedStore) {
 				for (const id of [...missingIds]) {
 					const stored = exprEvaluatedStore.take(id);
@@ -1000,7 +1015,7 @@ export class RdbgClient {
 				}
 			}
 			if (missingIds.size === 0) break;
-			if (poll > 0) await new Promise((r) => setTimeout(r, 80));
+			if (poll > 0) await new Promise((r) => setTimeout(r, VAR_FETCH_DELAY_MS));
 			for (const ev of (await this.pingDebugUIParams(base))?.exprEvaluated ?? []) {
 				consumeFromStoreOrPing(ev);
 			}

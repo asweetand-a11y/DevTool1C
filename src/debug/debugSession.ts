@@ -63,7 +63,10 @@ interface StoredBreakpoints {
 }
 
 /** Интервал опроса ping (rdbg pingDebugUIParams). В Конфигураторе 1С ping вызывается реже (по трафику rtgt?cmd=pingDBGTGT и rdbg?cmd=pingDebugUIParams — порядка сотен вызовов за сессию, не каждые 25 ms). */
-const PING_INTERVAL_MS = 400;
+const PING_INTERVAL_MS = 150;
+
+/** Задержка для получения переменных (мс): scheduleRefreshStackAndReveal, retry в variablesRequest/evaluateRequest. Сразу после setBreakOnNextStatement+step — getCallStack и variables. */
+const VAR_FETCH_DELAY_MS = 25;
 
 /** Минимальный интервал между вызовами pingDBGTGT по одной цели (чтобы не засорять логи и не нагружать сервер). */
 const PING_DBGTGT_INTERVAL_MS = 5000;
@@ -129,8 +132,6 @@ export class OnecDebugSession extends DebugSession {
 	private readonly references = new References();
 	/** Кэш результатов evalExpr по ключу targetId:frameIndex:expression. При пустом ответе сервера (данные не изменились) отдаём из кэша. */
 	private readonly evalExprCache = new Map<string, { result: string; typeName?: string; children?: EvalExprResult['children']; variablesRef: number }>();
-	/** Кэш локальных переменных по ключу targetId:frameIndex. При пустом ответе evalLocalVariables отдаём из кэша. */
-	private readonly localsCache = new Map<string, Array<{ name: string; value: string; type: string }>>();
 	/** exprEvaluated из pollPing для variablesRequest (race: pollPing и retry evalLocalVariables конкурируют за ping). */
 	private readonly exprEvaluatedStore = new Map<string, EvalExprResult>();
 	/** rteProcVersion по targetId (из rtgt pingDBGTGT) для RemoteDebuggerRunTime. */
@@ -240,8 +241,7 @@ export class OnecDebugSession extends DebugSession {
 		this.threadsCallStack.clear();
 	}
 
-	/** Очищает кэши Watch и локальных переменных. Вызывается при новой остановке и при отключении. */
-	/** Очистка кэша выражений (Watch). Кэш локальных переменных очищается только при смене стека (см. места threadsCallStack.set). */
+	/** Очистка кэша выражений (Watch, раскрываемые переменные). Вызывается при отключении. */
 	private clearEvalExprCache(): void {
 		this.evalExprCache.clear();
 	}
@@ -290,7 +290,7 @@ export class OnecDebugSession extends DebugSession {
 		}, 100);
 	}
 
-	/** После шага (F10/F11/Shift+F11) через 150 ms запрашивает getCallStack. Ping может вернуть бинарный стек без moduleIdStr/lineNo — getCallStack даёт полный XML для reveal. */
+	/** После шага (F10/F11/Shift+F11) сразу запрашивает getCallStack, отправляет StoppedEvent и invalidate — IDE запросит evalLocalVariables и evalExpr (Watch) без ожидания pollPing (150 ms). */
 	private scheduleRefreshStackAndReveal(threadId: number): void {
 		const existing = this.pendingStackRefreshTimeouts.get(threadId);
 		if (existing !== undefined) clearTimeout(existing);
@@ -306,18 +306,21 @@ export class OnecDebugSession extends DebugSession {
 				);
 				if (stack.length > 0) {
 					const current = this.threadsCallStack.get(threadId) ?? [];
-					if (!this.isCallStackEqual(current, stack)) {
+					const stackChanged = !this.isCallStackEqual(current, stack);
+					if (stackChanged) {
 						this.threadsCallStack.set(threadId, stack);
-						// Стек изменился — прежний кэш переменных больше не валиден (frameIndex указывает на др. процедуру)
-						this.localsCache.clear();
-						this.sendEvent(new InvalidatedEvent(['stack']));
+						// StoppedEvent сразу после getCallStack — IDE запросит evalLocalVariables и evalExpr (Watch); без этого ждали бы callStackFormed в pollPing (до 150 ms)
+						this.sendEvent(new StoppedEvent('step', threadId));
+						// Устанавливаем в Call Stack цель = текущая процедура (frameId 0)
+						const currentFrameId = threadId * 10000 + 1000;
+						this.sendEvent(new InvalidatedEvent(['stack', 'variables'], undefined, currentFrameId));
 						this.revealCurrentFrameInEditor(threadId);
 					}
 				}
 			} catch {
 				// игнорируем
 			}
-		}, 150);
+		}, VAR_FETCH_DELAY_MS);
 		this.pendingStackRefreshTimeouts.set(threadId, timeoutId);
 	}
 
@@ -435,10 +438,16 @@ export class OnecDebugSession extends DebugSession {
 			if (!result) return;
 
 			// exprEvaluated — для variablesRequest (retry evalLocalVariables конкурирует с pollPing за ping)
+			// Как только появились данные переменных — триггерим обновление VARIABLES и Watch в IDE
+			let hadNewExprEvaluated = false;
 			for (const ev of result.exprEvaluated ?? []) {
 				if (ev.expressionResultID && ev.result) {
 					this.exprEvaluatedStore.set(ev.expressionResultID, ev.result);
+					hadNewExprEvaluated = true;
 				}
+			}
+			if (hadNewExprEvaluated) {
+				this.sendEvent(new InvalidatedEvent(['variables']));
 			}
 
 			// Событие targetStarted — новая цель отладки (как в onec-debug-adapter DebugTargetsManager)
@@ -516,8 +525,10 @@ export class OnecDebugSession extends DebugSession {
 				// Ping может вернуть бинарный формат без moduleIdStr и lineNo — getCallStack даст полный XML. Не отменяем scheduleRefreshStackAndReveal.
 				const stackOrdered = csf.callStack;
 				this.threadsCallStack.set(threadId, stackOrdered);
-				this.localsCache.clear(); // Новая остановка — кэш переменных от предыдущей не валиден
 				this.sendEvent(new StoppedEvent(csf.reason, threadId));
+				// Устанавливаем в Call Stack цель = текущая процедура (frameId 0)
+				const currentFrameId = threadId * 10000 + 1000;
+				this.sendEvent(new InvalidatedEvent(['stack', 'variables'], undefined, currentFrameId));
 				this.revealCurrentFrameInEditor(threadId);
 				// getCallStack выполнится по таймеру и обновит стек полными данными (moduleIdStr, lineNo), затем reveal снова
 			}
@@ -688,7 +699,7 @@ export class OnecDebugSession extends DebugSession {
 
 					// В режиме attach: ждём появления целей до 15 с (клиент 1С может подключаться с задержкой)
 					const waitTargetsMs = _launch ? 0 : 15000;
-					const pollIntervalMs = 400;
+					const pollIntervalMs = 150;
 					for (let elapsed = 0; elapsed < waitTargetsMs && this.targets.length === 0; elapsed += pollIntervalMs) {
 						await new Promise((r) => setTimeout(r, pollIntervalMs));
 						try {
@@ -725,7 +736,7 @@ export class OnecDebugSession extends DebugSession {
 				if (_launch) {
 					this.run1cv8c(args, host, port);
 					const waitTargetsMs = 15000;
-					const pollIntervalMs = 400;
+					const pollIntervalMs = 150;
 					for (let elapsed = 0; elapsed < waitTargetsMs && this.targets.length === 0; elapsed += pollIntervalMs) {
 						await new Promise((r) => setTimeout(r, pollIntervalMs));
 						try {
@@ -1023,6 +1034,10 @@ export class OnecDebugSession extends DebugSession {
 					? new Source(path.basename(sourcePath) || 'module', sourcePath)
 					: (safeModuleIdStr ? new Source(safeModuleIdStr, '') : undefined);
 				const frame = new StackFrame(frameId, presentation, src, line);
+				// Фантомные/внутренние кадры — subtle, при F11 (шаг внутрь) фокус остаётся на процедуре пользователя
+				if (item.isFantom) {
+					(frame as DebugProtocol.StackFrame).presentationHint = 'subtle';
+				}
 				stackFrames.push(frame);
 			}
 		} else {
@@ -1057,7 +1072,7 @@ export class OnecDebugSession extends DebugSession {
 		this.sendResponse(response);
 	}
 
-	/** Сообщение сервера 400: вычисления только в остановленном предмете. При такой ошибке возвращаем кэш или пустой список, не показываем ошибку. */
+	/** Сообщение сервера 400: вычисления только в остановленном предмете. При такой ошибке возвращаем пустой список. */
 	private static isEvalOnlyWhenStoppedError(err: unknown): boolean {
 		const msg = err instanceof Error ? err.message : String(err ?? '');
 		return /400|остановленном предмете отладки|вычислений возможно только/i.test(msg);
@@ -1167,7 +1182,12 @@ export class OnecDebugSession extends DebugSession {
 				return;
 			}
 
-			const localsCacheKey = `${target.id}:${frameIndex}`;
+			// RDBG возвращает только контекст текущего кадра (как в Конфигураторе — stackLevel не передаётся).
+			// Для родительских кадров (frameIndex > 0) переменные недоступны.
+			if (frameIndex > 0) {
+				sendOnce({ variables: [] });
+				return;
+			}
 
 			const isExpandableType = (typeName?: string): boolean => {
 				const t = (typeName ?? '').trim();
@@ -1175,31 +1195,6 @@ export class OnecDebugSession extends DebugSession {
 				if (/^(Число|Строка|Булево|Дата|Неопределено|Null|УникальныйИдентификатор)$/i.test(t)) return false;
 				return true;
 			};
-
-			// Сначала проверяем кэш: при переключении кадров и после InvalidatedEvent возвращаем из кэша, без запроса на сервер.
-			const cachedLocalsFirst = this.localsCache.get(localsCacheKey);
-			if (cachedLocalsFirst !== undefined) {
-				this.sendEvent(new OutputEvent(
-					`[DEBUG] variablesRequest: HIT cache ${localsCacheKey} (${cachedLocalsFirst.length} vars)\n`,
-					'console',
-				));
-				const variables = cachedLocalsFirst.map((v) => {
-					const expandable = isExpandableType(v.type);
-					let variablesReference = 0;
-					if (expandable) {
-						variablesReference = this.references.registerVariable(`eval:${v.name}`, {
-							type: 'evalChildren',
-							expression: v.name,
-							frameIndex,
-							threadId,
-							children: [],
-						});
-					}
-					return { name: v.name, value: v.value, type: v.type, variablesReference };
-				});
-				sendOnce({ variables });
-				return;
-			}
 
 			const exprStore: ExprEvaluatedStore = {
 				take: (id) => {
@@ -1214,41 +1209,40 @@ export class OnecDebugSession extends DebugSession {
 			try {
 				// Один запрос evalLocalVariables (контекст) — быстрее batch, batch в фоне для раскрытия
 				result = await this.rdbgClient.evalLocalVariables(base, targetReq, frameIndex, exprStore);
-				if (result.variables.length === 0 && !this.localsCache.get(localsCacheKey)?.length) {
-					await new Promise((r) => setTimeout(r, 50));
+				if (result.variables.length === 0) {
+					await new Promise((r) => setTimeout(r, VAR_FETCH_DELAY_MS));
 					result = await this.rdbgClient.evalLocalVariables(base, targetReq, frameIndex, exprStore);
 				}
 			} catch (err) {
-				// 400 «выполнение вычислений возможно только в остановленном предмете отладки» — отдаём кэш или пустой список, чтобы колесо не крутилось
+				// 400 «только в остановленном предмете» — после F10/F11 сервер может быть ещё не готов, повторяем с паузой
 				if (OnecDebugSession.isEvalOnlyWhenStoppedError(err)) {
-					const cachedLocals = this.localsCache.get(localsCacheKey);
-					const variables = (cachedLocals ?? []).map((v) => {
-						const expandable = isExpandableType(v.type);
-						let variablesReference = 0;
-						if (expandable) {
-							variablesReference = this.references.registerVariable(`eval:${v.name}`, {
-								type: 'evalChildren',
-								expression: v.name,
-								frameIndex,
-								threadId,
-								children: [],
-							});
+					result = { variables: [] };
+					for (const delayMs of [VAR_FETCH_DELAY_MS, VAR_FETCH_DELAY_MS]) {
+						await new Promise((r) => setTimeout(r, delayMs));
+						try {
+							result = await this.rdbgClient.evalLocalVariables(base, targetReq, frameIndex, exprStore);
+							if (result.variables.length > 0) break;
+						} catch {
+							// продолжим цикл
 						}
-						return { name: v.name, value: v.value, type: v.type, variablesReference };
+					}
+					if (!result || result.variables.length === 0) {
+						sendOnce({ variables: [] });
+						return;
+					}
+					// result есть, пойдём в общий путь маппинга
+				} else {
+					sendOnce({
+						variables: [
+							{
+								name: 'Ошибка',
+								value: `Не удалось получить переменные: ${err instanceof Error ? err.message : String(err)}`,
+								variablesReference: 0,
+							},
+						],
 					});
-					sendOnce({ variables });
 					return;
 				}
-				sendOnce({
-					variables: [
-						{
-							name: 'Ошибка',
-							value: `Не удалось получить переменные: ${err instanceof Error ? err.message : String(err)}`,
-							variablesReference: 0,
-						},
-					],
-				});
-				return;
 			}
 
 			let variables = result.variables.map(v => {
@@ -1272,26 +1266,9 @@ export class OnecDebugSession extends DebugSession {
 			});
 
 			if (variables.length === 0) {
-				const cachedLocals = this.localsCache.get(localsCacheKey);
-				if (cachedLocals && cachedLocals.length > 0) {
-					variables = cachedLocals.map(v => {
-						const expandable = isExpandableType(v.type);
-						let variablesReference = 0;
-						if (expandable) {
-							variablesReference = this.references.registerVariable(`eval:${v.name}`, {
-								type: 'evalChildren',
-								expression: v.name,
-								frameIndex,
-								threadId,
-								children: [],
-							});
-						}
-						return { ...v, variablesReference };
-					});
-				} else {
-					const stack = this.threadsCallStack.get(threadId) ?? [];
-					const item = stack[frameIndex];
-					if (item && typeof item.lineNo !== 'undefined') {
+				const stack = this.threadsCallStack.get(threadId) ?? [];
+				const item = stack[frameIndex];
+				if (item && typeof item.lineNo !== 'undefined') {
 						const root = this.rootProject || '';
 						let modulePath = '';
 						if (item.moduleId?.objectId && item.moduleId?.propertyId) {
@@ -1318,13 +1295,10 @@ export class OnecDebugSession extends DebugSession {
 						}
 				}
 			}
-		}
 
-			// Кэшируем итоговый результат (в т.ч. пустой) — при переключении кадров не слать повторный запрос
-			this.localsCache.set(localsCacheKey, variables.map(v => ({ name: v.name, value: v.value, type: v.type })));
 			sendOnce({ variables });
 			// Батч по раскрываемым в фоне — при раскрытии узла данные уже в кэше
-			const expandableNames = variables.filter((v) => isExpandableType(v.type ?? v.typeName)).map((v) => v.name);
+			const expandableNames = variables.filter((v) => isExpandableType(v.type)).map((v) => v.name);
 			if (expandableNames.length > 0) {
 				void this.rdbgClient.evalLocalVariablesBatch(base, targetReq, frameIndex, expandableNames, exprStore).then((batch) => {
 					for (const [expr, evalResult] of Object.entries(batch.childrenByExpression)) {
@@ -1445,12 +1419,11 @@ export class OnecDebugSession extends DebugSession {
 			return;
 		}
 
-		// Определяем frameIndex из args.frameId (frameId 1000+ в stackTraceRequest)
+		// frameId = threadId*10000 + 1000 + i (как в stackTraceRequest)
 		const frameId = args.frameId ?? 0;
-		const frameIndex = frameId >= 1000 ? frameId - 1000 : 0;
-		
-		// Используем первую цель отладки (упрощённо, как в плане)
-		const target = this.targets[0];
+		const threadId = frameId >= 10000 ? Math.floor(frameId / 10000) : 1;
+		const frameIndex = frameId >= 1000 ? Math.max(0, (frameId % 10000) - 1000) : 0;
+		const target = this.targets[threadId - 1] ?? this.targets[0];
 		if (!target) {
 			response.body = {
 				result: 'Нет активной цели отладки',
@@ -1516,6 +1489,44 @@ export class OnecDebugSession extends DebugSession {
 				variablesReference,
 			};
 		} catch (err) {
+			// 400 «только в остановленном предмете» — после F10/F11 повторяем с паузой
+			if (OnecDebugSession.isEvalOnlyWhenStoppedError(err)) {
+				await new Promise((r) => setTimeout(r, VAR_FETCH_DELAY_MS));
+				try {
+					const retryResult = await this.rdbgClient.evalExpr(
+						{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+						{ id: target.id },
+						args.expression,
+						frameIndex,
+					);
+					if (retryResult.error) {
+						response.body = { result: retryResult.error, variablesReference: 0 };
+					} else {
+						const rr = retryResult.result ?? '';
+						const ch = retryResult.children ?? [];
+						let vref = 0;
+						if (ch.length > 0) {
+							vref = this.references.registerVariable(`eval:${args.expression}`, {
+								type: 'evalChildren',
+								children: ch,
+								frameIndex,
+								threadId,
+							});
+						}
+						this.evalExprCache.set(cacheKey, {
+							result: rr,
+							typeName: retryResult.typeName,
+							children: ch,
+							variablesRef: vref,
+						});
+						response.body = { result: rr || retryResult.typeName || '', variablesReference: vref };
+					}
+					this.sendResponse(response);
+					return;
+				} catch {
+					// оставляем ошибку ниже
+				}
+			}
 			response.body = {
 				result: `Ошибка вычисления: ${err instanceof Error ? err.message : String(err)}`,
 				variablesReference: 0,
