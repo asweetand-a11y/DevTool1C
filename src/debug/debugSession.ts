@@ -308,6 +308,8 @@ export class OnecDebugSession extends DebugSession {
 					const current = this.threadsCallStack.get(threadId) ?? [];
 					if (!this.isCallStackEqual(current, stack)) {
 						this.threadsCallStack.set(threadId, stack);
+						// Стек изменился — прежний кэш переменных больше не валиден (frameIndex указывает на др. процедуру)
+						this.localsCache.clear();
 						this.sendEvent(new InvalidatedEvent(['stack']));
 						this.revealCurrentFrameInEditor(threadId);
 					}
@@ -514,6 +516,7 @@ export class OnecDebugSession extends DebugSession {
 				// Ping может вернуть бинарный формат без moduleIdStr и lineNo — getCallStack даст полный XML. Не отменяем scheduleRefreshStackAndReveal.
 				const stackOrdered = csf.callStack;
 				this.threadsCallStack.set(threadId, stackOrdered);
+				this.localsCache.clear(); // Новая остановка — кэш переменных от предыдущей не валиден
 				this.sendEvent(new StoppedEvent(csf.reason, threadId));
 				this.revealCurrentFrameInEditor(threadId);
 				// getCallStack выполнится по таймеру и обновит стек полными данными (moduleIdStr, lineNo), затем reveal снова
@@ -1173,9 +1176,13 @@ export class OnecDebugSession extends DebugSession {
 				return true;
 			};
 
-			// Сначала проверяем кэш: повторные запросы (напр. после InvalidatedEvent) не слать на сервер — он может вернуть пустой ответ «ничего не изменилось»
+			// Сначала проверяем кэш: при переключении кадров и после InvalidatedEvent возвращаем из кэша, без запроса на сервер.
 			const cachedLocalsFirst = this.localsCache.get(localsCacheKey);
-			if (cachedLocalsFirst && cachedLocalsFirst.length > 0) {
+			if (cachedLocalsFirst !== undefined) {
+				this.sendEvent(new OutputEvent(
+					`[DEBUG] variablesRequest: HIT cache ${localsCacheKey} (${cachedLocalsFirst.length} vars)\n`,
+					'console',
+				));
 				const variables = cachedLocalsFirst.map((v) => {
 					const expandable = isExpandableType(v.type);
 					let variablesReference = 0;
@@ -1204,50 +1211,12 @@ export class OnecDebugSession extends DebugSession {
 			const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
 			const targetReq = { id: target.id };
 			let result: { variables: Array<{ name: string; value: string; typeName?: string }> };
-			let usedBatchFirst = false;
 			try {
-				// Batch-first: если знаем имена переменных из процедуры — один запрос (variables + children)
-				const stack = this.threadsCallStack.get(threadId) ?? [];
-				const item = stack[frameIndex];
-				let expandableFromProc: string[] = [];
-				if (item && typeof item.lineNo !== 'undefined') {
-					const root = this.rootProject || '';
-					let modulePath = '';
-					if (item.moduleId?.objectId && item.moduleId?.propertyId) {
-						modulePath = getModulePathByObjectProperty(root, item.moduleId.objectId, item.moduleId.propertyId);
-					}
-					if (!modulePath && item.moduleIdStr?.trim()) {
-						modulePath = getModulePathByModuleIdStr(root, item.moduleIdStr);
-					}
-					if (!modulePath) {
-						const active = vscode.window.activeTextEditor;
-						if (active?.document.fileName.toLowerCase().endsWith('.bsl')) {
-							modulePath = active.document.uri.fsPath;
-						}
-					}
-					if (modulePath) {
-						const lineNo = typeof item.lineNo === 'number' ? item.lineNo : parseInt(String(item.lineNo ?? 0), 10) || 1;
-						expandableFromProc = await getVariableNamesFromProcedureAtLine(modulePath, lineNo, root);
-					}
-				}
-				if (expandableFromProc.length > 0) {
-					usedBatchFirst = true;
-					const batch = await this.rdbgClient.evalLocalVariablesBatch(base, targetReq, frameIndex, expandableFromProc, exprStore);
-					result = { variables: batch.variables };
-					for (const [expr, evalResult] of Object.entries(batch.childrenByExpression)) {
-						this.evalExprCache.set(`${target.id}:${frameIndex}:${expr}`, {
-							result: evalResult.result ?? '',
-							typeName: evalResult.typeName,
-							children: evalResult.children,
-							variablesRef: 0,
-						});
-					}
-				} else {
+				// Один запрос evalLocalVariables (контекст) — быстрее batch, batch в фоне для раскрытия
+				result = await this.rdbgClient.evalLocalVariables(base, targetReq, frameIndex, exprStore);
+				if (result.variables.length === 0 && !this.localsCache.get(localsCacheKey)?.length) {
+					await new Promise((r) => setTimeout(r, 50));
 					result = await this.rdbgClient.evalLocalVariables(base, targetReq, frameIndex, exprStore);
-					if (result.variables.length === 0 && !this.localsCache.get(localsCacheKey)?.length) {
-						await new Promise((r) => setTimeout(r, 80));
-						result = await this.rdbgClient.evalLocalVariables(base, targetReq, frameIndex, exprStore);
-					}
 				}
 			} catch (err) {
 				// 400 «выполнение вычислений возможно только в остановленном предмете отладки» — отдаём кэш или пустой список, чтобы колесо не крутилось
@@ -1302,9 +1271,7 @@ export class OnecDebugSession extends DebugSession {
 				};
 			});
 
-			if (variables.length > 0) {
-				this.localsCache.set(localsCacheKey, variables.map(v => ({ name: v.name, value: v.value, type: v.type })));
-			} else {
+			if (variables.length === 0) {
 				const cachedLocals = this.localsCache.get(localsCacheKey);
 				if (cachedLocals && cachedLocals.length > 0) {
 					variables = cachedLocals.map(v => {
@@ -1349,26 +1316,26 @@ export class OnecDebugSession extends DebugSession {
 								variablesReference: 0,
 							}));
 						}
-					}
 				}
 			}
+		}
 
+			// Кэшируем итоговый результат (в т.ч. пустой) — при переключении кадров не слать повторный запрос
+			this.localsCache.set(localsCacheKey, variables.map(v => ({ name: v.name, value: v.value, type: v.type })));
 			sendOnce({ variables });
-			// Батч по раскрываемым — только если не использовали batch-first (children уже в кэше)
-			if (!usedBatchFirst) {
-				const expandableNames = result.variables.filter((v) => isExpandableType(v.typeName)).map((v) => v.name);
-				if (expandableNames.length > 0) {
-					void this.rdbgClient.evalLocalVariablesBatch(base, targetReq, frameIndex, expandableNames, exprStore).then((batch) => {
-						for (const [expr, evalResult] of Object.entries(batch.childrenByExpression)) {
-							this.evalExprCache.set(`${target.id}:${frameIndex}:${expr}`, {
-								result: evalResult.result ?? '',
-								typeName: evalResult.typeName,
-								children: evalResult.children,
-								variablesRef: 0,
-							});
-						}
-					}).catch(() => {});
-				}
+			// Батч по раскрываемым в фоне — при раскрытии узла данные уже в кэше
+			const expandableNames = variables.filter((v) => isExpandableType(v.type ?? v.typeName)).map((v) => v.name);
+			if (expandableNames.length > 0) {
+				void this.rdbgClient.evalLocalVariablesBatch(base, targetReq, frameIndex, expandableNames, exprStore).then((batch) => {
+					for (const [expr, evalResult] of Object.entries(batch.childrenByExpression)) {
+						this.evalExprCache.set(`${target.id}:${frameIndex}:${expr}`, {
+							result: evalResult.result ?? '',
+							typeName: evalResult.typeName,
+							children: evalResult.children,
+							variablesRef: 0,
+						});
+					}
+				}).catch(() => {});
 			}
 		} finally {
 			if (!responseSent) {

@@ -71,7 +71,7 @@ function buildStepRequestBody(base: RDbgBaseRequest, targetId: DebugTargetIdLigh
 		`</request>`;
 }
 
-/** Тело запроса getCallStack. Как step/evalLocalVariables: debugBaseData + targetID с префиксом (сервер 8.3.27 ожидает targetID, не id). */
+/** Тело запроса getCallStack. RDBGGetCallStackRequest использует свойство Id (не targetID), два idOfDebuggerUI как step. */
 function buildGetCallStackRequestBody(base: RDbgBaseRequest, targetId: DebugTargetIdLight): string {
 	const alias = escapeXml(base.infoBaseAlias);
 	const dbgui = escapeXml(base.idOfDebuggerUi);
@@ -79,7 +79,8 @@ function buildGetCallStackRequestBody(base: RDbgBaseRequest, targetId: DebugTarg
 	return `<?xml version="1.0" encoding="UTF-8"?><request ${STEP_REQUEST_NAMESPACES}>` +
 		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
-		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
+		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
+		`<debugRDBGRequestResponse:id><id>${id}</id></debugRDBGRequestResponse:id>` +
 		`</request>`;
 }
 
