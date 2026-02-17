@@ -66,8 +66,8 @@ interface StoredBreakpoints {
 /** Интервал опроса ping (rdbg pingDebugUIParams). В Конфигураторе 1С ping вызывается реже (по трафику rtgt?cmd=pingDBGTGT и rdbg?cmd=pingDebugUIParams — порядка сотен вызовов за сессию, не каждые 25 ms). */
 const PING_INTERVAL_MS = 150;
 
-/** Задержка для получения переменных (мс): scheduleRefreshStackAndReveal, retry в variablesRequest/evaluateRequest. */
-const VAR_FETCH_DELAY_MS = 25;
+/** Задержка retry для variablesRequest, scheduleRefreshStackAndReveal, evaluateRequest. 50 ms — как в Конфигураторе. */
+const VAR_FETCH_DELAY_MS = 50;
 
 /** Задержка scheduleRefreshStackAndReveal для Step In/Out — серверу нужно больше времени для входа в процедуру. */
 const STEP_IN_OUT_DELAY_MS = 75;

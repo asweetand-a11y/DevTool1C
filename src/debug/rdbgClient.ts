@@ -46,7 +46,8 @@ import { NS, ResponseSchema, DbguiExtCmds } from './xdtoSchema';
 const RDBG_REQUEST_WINDOWS_1251 = true;
 
 /** Таймаут для получения переменных (мс): задержки между retry. */
-const VAR_FETCH_DELAY_MS = 25;
+/** Задержка между итерациями retry при пустом ответе evalLocalVariables/evalExpr. 50 ms — как в Конфигураторе (ориентир 50–80 ms). */
+const VAR_FETCH_DELAY_MS = 50;
 
 /** calcWaitingTime в запросах evalLocalVariables/evalExpr — время ожидания сервером результата. 100 как в Конфигураторе; 25 слишком мало — сервер возвращает пустой ответ. */
 const CALC_WAITING_TIME_MS = 100;
