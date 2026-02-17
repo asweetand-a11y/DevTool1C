@@ -319,3 +319,30 @@ export function getModulePathByObjectProperty(rootProject: string, objectId: str
 	}
 	return '';
 }
+
+/**
+ * Обратный поиск по moduleIdStr (fallback, когда objectId/propertyId из сервера не совпадают с проектом).
+ * Сервер возвращает строки вида "Документ.ПриходнаяНакладная.МодульОбъекта" — сравниваем с кэшем.
+ */
+export function getModulePathByModuleIdStr(rootProject: string, moduleIdStr: string): string {
+	if (!rootProject || !moduleIdStr || typeof moduleIdStr !== 'string') return '';
+	const normalized = moduleIdStr.trim();
+	if (!normalized) return '';
+	fillCache(rootProject);
+	const root = normalizePath(rootProject);
+	const cache = cacheByRoot.get(root);
+	if (!cache) return '';
+	for (const info of cache.values()) {
+		if (info.moduleIdString === normalized) return info.path;
+	}
+	// Гибкое сопоставление: Документ/Document, МодульОбъекта/ObjectModule и т.п.
+	const alt = normalized
+		.replace(/\bDocument\b/i, 'Документ')
+		.replace(/\bObjectModule\b/i, 'МодульОбъекта')
+		.replace(/\bManagerModule\b/i, 'МодульМенеджера')
+		.replace(/\bForm\b(?!\.)/i, 'Форма');
+	for (const info of cache.values()) {
+		if (info.moduleIdString === alt) return info.path;
+	}
+	return '';
+}

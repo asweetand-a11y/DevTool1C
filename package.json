@@ -2,7 +2,7 @@
   "name": "1c-dev-tools",
   "displayName": "1C Dev Tools",
   "description": "Расширение для Cursor с инструментами разработки для экосистемы 1С. Предоставляет удобный интерфейс для работы с проектами 1С, включая разбор обработок, отчетов и конфигураций.",
-  "version": "2.9.4",
+  "version": "2.9.5",
   "publisher": "whiterabbit",
   "repository": {
     "type": "git",
@@ -52,31 +52,109 @@
           "launch": {
             "required": [],
             "properties": {
-              "request": { "type": "string", "enum": ["launch", "attach"], "description": "Request type" },
-              "name": { "type": "string", "description": "Configuration name" },
-              "debugServerHost": { "type": "string", "description": "Debug server host (env.json --debug-server)" },
-              "debugServerPort": { "type": "number", "description": "Debug server port (env.json --debug-port-range)", "default": 1560 },
-              "infoBaseAlias": { "type": "string", "description": "RDBG info base alias (DefAlias for file-based)" },
-              "ibconnection": { "type": "string", "description": "IB connection (env.json --ibconnection)" },
-              "infoBase": { "type": "string", "description": "Info base name (env.json --infoBase)" },
-              "rootProject": { "type": "string", "description": "Root project path (workspace folder)" },
-              "platformPath": { "type": "string", "description": "1C platform path (env.json --v8-platform-root)" },
-              "platformVersion": { "type": "string", "description": "Platform version (env.json --v8version)" },
-              "extensions": { "type": "array", "items": { "type": "string" }, "description": "Extension paths" },
-              "autoAttachTypes": { "type": "array", "items": { "type": "string", "enum": ["Client", "Server"] }, "description": "Auto-attach target types" }
+              "request": {
+                "type": "string",
+                "enum": [
+                  "launch",
+                  "attach"
+                ],
+                "description": "Request type"
+              },
+              "name": {
+                "type": "string",
+                "description": "Configuration name"
+              },
+              "debugServerHost": {
+                "type": "string",
+                "description": "Debug server host (env.json --debug-server)"
+              },
+              "debugServerPort": {
+                "type": "number",
+                "description": "Debug server port (env.json --debug-port-range)",
+                "default": 1560
+              },
+              "infoBaseAlias": {
+                "type": "string",
+                "description": "RDBG info base alias (DefAlias for file-based)"
+              },
+              "ibconnection": {
+                "type": "string",
+                "description": "IB connection (env.json --ibconnection)"
+              },
+              "infoBase": {
+                "type": "string",
+                "description": "Info base name (env.json --infoBase)"
+              },
+              "rootProject": {
+                "type": "string",
+                "description": "Root project path (workspace folder)"
+              },
+              "platformPath": {
+                "type": "string",
+                "description": "1C platform path (env.json --v8-platform-root)"
+              },
+              "platformVersion": {
+                "type": "string",
+                "description": "Platform version (env.json --v8version)"
+              },
+              "extensions": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extension paths"
+              },
+              "autoAttachTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "enum": [
+                    "Client",
+                    "Server"
+                  ]
+                },
+                "description": "Auto-attach target types"
+              }
             }
           },
           "attach": {
             "required": [],
             "properties": {
-              "request": { "type": "string", "enum": ["attach"] },
-              "name": { "type": "string" },
-              "debugServerHost": { "type": "string", "description": "env.json --debug-server" },
-              "debugServerPort": { "type": "number", "default": 1560, "description": "env.json --debug-port-range" },
-              "infoBaseAlias": { "type": "string", "description": "RDBG alias (DefAlias for file-based)" },
-              "ibconnection": { "type": "string", "description": "env.json --ibconnection" },
-              "rootProject": { "type": "string" },
-              "autoAttachTypes": { "type": "array", "items": { "type": "string" } }
+              "request": {
+                "type": "string",
+                "enum": [
+                  "attach"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "debugServerHost": {
+                "type": "string",
+                "description": "env.json --debug-server"
+              },
+              "debugServerPort": {
+                "type": "number",
+                "default": 1560,
+                "description": "env.json --debug-port-range"
+              },
+              "infoBaseAlias": {
+                "type": "string",
+                "description": "RDBG alias (DefAlias for file-based)"
+              },
+              "ibconnection": {
+                "type": "string",
+                "description": "env.json --ibconnection"
+              },
+              "rootProject": {
+                "type": "string"
+              },
+              "autoAttachTypes": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              }
             }
           }
         },
@@ -89,7 +167,10 @@
             "debugServerPort": 1560,
             "infoBaseAlias": "DefAlias",
             "rootProject": "${workspaceFolder}",
-            "autoAttachTypes": ["Client", "Server"]
+            "autoAttachTypes": [
+              "Client",
+              "Server"
+            ]
           }
         ],
         "configurationSnippets": [
@@ -104,7 +185,10 @@
               "debugServerPort": 1560,
               "infoBaseAlias": "DefAlias",
               "rootProject": "${workspaceFolder}",
-              "autoAttachTypes": ["Client", "Server"]
+              "autoAttachTypes": [
+                "Client",
+                "Server"
+              ]
             }
           },
           {
@@ -118,7 +202,10 @@
               "debugServerPort": 1560,
               "infoBaseAlias": "DefAlias",
               "rootProject": "${workspaceFolder}",
-              "autoAttachTypes": ["Client", "Server"]
+              "autoAttachTypes": [
+                "Client",
+                "Server"
+              ]
             }
           }
         ]
@@ -475,7 +562,8 @@
   "dependencies": {
     "@vscode/debugadapter": "^1.68.0",
     "@vscode/debugprotocol": "^1.68.0",
-    "fast-xml-parser": "^4.5.0"
+    "fast-xml-parser": "^4.5.0",
+    "iconv-lite": "^0.7.2"
   },
   "devDependencies": {
     "@types/node": "22.x",

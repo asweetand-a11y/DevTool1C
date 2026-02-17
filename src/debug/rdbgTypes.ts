@@ -55,7 +55,7 @@ export interface DebugTargetIdLight {
 	id: string;
 }
 
-/** Элемент ответа getDbgTargets (полный DebugTargetId в XML). */
+/** Элемент ответа getDbgTargets / step (полный DebugTargetId в XML). targetIDStr — Base64 сериализованного XDTO DebugTargetIdStr, приходит от сервера; нужен для RemoteDebuggerRunTime (register, evalExprStartStop). */
 export interface DebugTargetId {
 	id: string;
 	seanceId?: string;
@@ -63,6 +63,8 @@ export interface DebugTargetId {
 	infoBaseAlias?: string;
 	targetType?: string;
 	userName?: string;
+	/** Строка от сервера для запросов RemoteDebuggerRunTime (не формировать из id вручную). */
+	targetIDStr?: string;
 	[key: string]: unknown;
 }
 
@@ -155,9 +157,13 @@ export type CallStackStopReason = 'Breakpoint' | 'Step' | 'Exception';
 export interface CallStackFormedResult {
 	callStack: StackItemViewInfoData[];
 	targetId: string;
+	/** Base64 targetIDStr из XML (для сопоставления с целью, когда targetId пуст). */
+	targetIDStr?: string;
 	reason: CallStackStopReason;
 	stopByBp?: boolean;
 	suspendedByOther?: boolean;
+	/** Base64 из ответа ping (resultStr), если платформа вернула. */
+	dataBase64?: string;
 }
 
 /** Один результат exprEvaluated в ping (результат вычисления, доставленный асинхронно в ping). */
@@ -188,6 +194,11 @@ export interface EvalExprChild {
 	name: string;
 	value: string;
 	typeName?: string;
+}
+
+/** Хранилище exprEvaluated из ping. pollPing сохраняет; evalLocalVariables проверяет при пустом ответе (race с pollPing). */
+export interface ExprEvaluatedStore {
+	take(id: string): EvalExprResult | undefined;
 }
 
 /** Результат вычисления выражения evalExpr. */
@@ -234,6 +245,18 @@ export interface InitialDebugSettings {
 export interface AttachDetachTargetsCommand {
 	attach?: string[]; // массив ID целей для подключения
 	detach?: string[]; // массив ID целей для отключения
+}
+
+/** Результат pingDBGTGT (rtgt): актуальное состояние цели и rteProcVersion для RemoteDebuggerRunTime. */
+export interface PingDBGTGTResult {
+	rteProcVersion?: string;
+}
+
+/** Состояние окружения для RemoteDebuggerRunTime (evalExprStartStop). */
+export interface RemoteDebuggerEnvState {
+	breakOnNextLine?: boolean;
+	bpVersion?: string;
+	rteProcVersion?: string;
 }
 
 /** Настройки автоподключения для setAutoAttachSettings. */

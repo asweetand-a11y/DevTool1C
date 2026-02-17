@@ -12,6 +12,7 @@ export const NS = {
 	debugBaseData: 'http://v8.1c.ru/8.3/debugger/debugBaseData',
 	debugRTEFilter: 'http://v8.1c.ru/8.3/debugger/debugRTEFilter',
 	debugAutoAttach: 'http://v8.1c.ru/8.3/debugger/debugAutoAttach',
+	dbgtgtRemoteRequestResponse: 'http://v8.1c.ru/8.3/debugger/dbgtgtRemoteRequestResponse',
 	xsi: 'http://www.w3.org/2001/XMLSchema-instance',
 } as const;
 

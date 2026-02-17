@@ -22,7 +22,7 @@ import { randomUUID } from 'node:crypto';
 import { getLastDbgsLaunch } from './dbgsLaunchInfo';
 import { format1cv8cCommandLine, launch1cv8c, resolvePlatformBin } from './launch1cv8c';
 import { getVariableNamesFromProcedureAtLine } from './bslProcedureVariables';
-import { getModuleInfoByPath, getModulePathByObjectProperty } from './metadataProvider';
+import { getModuleInfoByPath, getModulePathByModuleIdStr, getModulePathByObjectProperty } from './metadataProvider';
 import { RdbgClient } from './rdbgClient';
 import {
 	AttachDebugUiResult,
@@ -30,6 +30,7 @@ import {
 	type DebugTargetId,
 	type DebugStepAction,
 	type EvalExprResult,
+	type ExprEvaluatedStore,
 	type ModuleBpInfoForRequest,
 	type BreakpointInfoRdbg,
 	type StackItemViewInfoData,
@@ -63,6 +64,9 @@ interface StoredBreakpoints {
 
 /** Интервал опроса ping (rdbg pingDebugUIParams). В Конфигураторе 1С ping вызывается реже (по трафику rtgt?cmd=pingDBGTGT и rdbg?cmd=pingDebugUIParams — порядка сотен вызовов за сессию, не каждые 25 ms). */
 const PING_INTERVAL_MS = 400;
+
+/** Минимальный интервал между вызовами pingDBGTGT по одной цели (чтобы не засорять логи и не нагружать сервер). */
+const PING_DBGTGT_INTERVAL_MS = 5000;
 
 /** Отображаемое имя типа цели в Call Stack (перевод на русский). */
 const TARGET_TYPE_LABELS: Record<string, string> = {
@@ -127,9 +131,15 @@ export class OnecDebugSession extends DebugSession {
 	private readonly evalExprCache = new Map<string, { result: string; typeName?: string; children?: EvalExprResult['children']; variablesRef: number }>();
 	/** Кэш локальных переменных по ключу targetId:frameIndex. При пустом ответе evalLocalVariables отдаём из кэша. */
 	private readonly localsCache = new Map<string, Array<{ name: string; value: string; type: string }>>();
+	/** exprEvaluated из pollPing для variablesRequest (race: pollPing и retry evalLocalVariables конкурируют за ping). */
+	private readonly exprEvaluatedStore = new Map<string, EvalExprResult>();
+	/** rteProcVersion по targetId (из rtgt pingDBGTGT) для RemoteDebuggerRunTime. */
+	private readonly rteProcVersionByTargetId = new Map<string, string>();
+	/** bpVersion из ответа setBreakpoints (для RemoteDebuggerRunTime). */
+	private lastBpVersion: string | undefined;
 	private pingTimer: ReturnType<typeof setInterval> | undefined;
 	private pingCount = 0;
-	/** Таймеры отложенного getCallStack после Step (F10/F11/Shift+F11). Отменяются при приходе callStackFormed, чтобы не дублировать запрос. */
+	/** Таймеры отложенного getCallStack после Step (F10/F11/Shift+F11). */
 	private readonly pendingStackRefreshTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
 	private autoAttachTypes: string[] = [];
 	/** Процесс 1cv8c, запущенный в режиме launch. Нужен для завершения при остановке отладки. */
@@ -156,12 +166,62 @@ export class OnecDebugSession extends DebugSession {
 	 * Подключение к целям отладки (как onec-debug-adapter DebugTargetsManager.AttachDebugTargets).
 	 * Вызывает clearBreakOnNextStatement и attachDetachDbgTargets(attach=true).
 	 */
+	/** Убирает дубликаты целей по id (первое вхождение сохраняется). */
+	private deduplicateTargetsById(targets: DebugTargetId[]): DebugTargetId[] {
+		const seen = new Set<string>();
+		return targets.filter((t) => {
+			const id = t.id?.trim() ?? '';
+			if (!id || seen.has(id)) return false;
+			seen.add(id);
+			return true;
+		});
+	}
+
+	/** targetIDStr для RemoteDebuggerRunTime: только из ответа сервера (getDbgTargets/step), не формировать из id. */
+	private getTargetIDStr(target: DebugTargetId): string | undefined {
+		return target.targetIDStr && target.targetIDStr.trim() !== '' ? target.targetIDStr : undefined;
+	}
+
+	/** Обновляет targetIDStr у целей из ответа step/getDbgTargets (response.item или response.id с targetIDStr). */
+	private mergeTargetIDStrFromResponse(response: unknown): void {
+		if (!response || typeof response !== 'object') return;
+		const r = response as Record<string, unknown>;
+		const list = r.item ?? r.id;
+		const items = Array.isArray(list) ? list : list != null ? [list] : [];
+		for (const it of items) {
+			const item = it as Record<string, unknown>;
+			const str = item.targetIDStr ?? item.TargetIDStr;
+			if (str == null || String(str).trim() === '') continue;
+			const targetIdNode = item.targetID ?? item.TargetID;
+			const flat = targetIdNode && typeof targetIdNode === 'object' ? (targetIdNode as Record<string, unknown>) : item;
+			const id = String(flat.id ?? flat.Id ?? item.id ?? item.Id ?? '');
+			if (!id) continue;
+			const t = this.targets.find((x) => x.id === id);
+			if (t) t.targetIDStr = String(str).trim();
+		}
+	}
+
 	private async attachToTargets(targets: DebugTargetId[]): Promise<void> {
 		if (!this.rdbgClient || targets.length === 0) return;
 		const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
 		try {
 			await this.rdbgClient.clearBreakOnNextStatement(base);
 			await this.rdbgClient.attachDetachDbgTargets(base, { attach: targets.map((t) => t.id), detach: [] });
+			for (const t of targets) {
+				try {
+					await this.rdbgClient.startDBGTGT(base, t.id);
+				} catch {
+					// игнорируем ошибки startDBGTGT
+				}
+				const targetIDStr = this.getTargetIDStr(t);
+				if (targetIDStr) {
+					try {
+						await this.rdbgClient.registerRemoteDebuggerRunTime(base, targetIDStr, true);
+					} catch {
+						// игнорируем ошибки register
+					}
+				}
+			}
 		} catch {
 			// игнорируем ошибки attach
 		}
@@ -192,19 +252,26 @@ export class OnecDebugSession extends DebugSession {
 			const stack = this.threadsCallStack.get(threadId);
 			if (!stack?.length) return;
 			const item = stack[0];
+			const root = this.rootProject || '';
+			let sourcePath = '';
 			const objectId = (item.moduleId?.objectId ?? '').trim();
 			const propertyId = (item.moduleId?.propertyId ?? '').trim();
-			if (!objectId || !propertyId) return;
-			const root = this.rootProject || '';
-			const sourcePath = getModulePathByObjectProperty(root, objectId, propertyId);
+			if (objectId && propertyId) {
+				sourcePath = getModulePathByObjectProperty(root, objectId, propertyId);
+			}
+			if (!sourcePath && item.moduleIdStr?.trim()) {
+				sourcePath = getModulePathByModuleIdStr(root, item.moduleIdStr);
+			}
 			if (!sourcePath) return;
 			const fullPath = path.isAbsolute(sourcePath) ? sourcePath : path.resolve(root, sourcePath);
 			const line = typeof item.lineNo === 'number' ? item.lineNo : parseInt(String(item.lineNo ?? 0), 10) || 1;
 			const line0 = Math.max(0, line - 1);
 			const uri = vscode.Uri.file(fullPath);
 			void vscode.window.showTextDocument(uri, {
-				selection: new vscode.Range(line0, 0, line0, 0),
+				// Выделяем всю строку (как в Конфигураторе 1С) — подсветка текущей позиции исполнения
+				selection: new vscode.Range(line0, 0, line0 + 1, 0),
 				preview: false,
+				viewColumn: vscode.ViewColumn.One,
 			});
 		}, 150);
 	}
@@ -306,13 +373,9 @@ export class OnecDebugSession extends DebugSession {
 						});
 					}
 					if (list.length > 0) {
-						const newTargets: DebugTargetId[] = [];
-						for (const t of list) {
-							if (!this.targets.some((existing) => existing.id === t.id)) {
-								this.targets.push(t);
-								newTargets.push(t);
-							}
-						}
+						const merged = this.deduplicateTargetsById([...this.targets, ...list]);
+						const newTargets = merged.filter((t) => !this.targets.some((existing) => existing.id === t.id));
+						this.targets = merged;
 						if (newTargets.length > 0) {
 							await this.attachToTargets(newTargets);
 							// Удаляем placeholder «1C: Main», если он был
@@ -340,22 +403,40 @@ export class OnecDebugSession extends DebugSession {
 				infoBaseAlias: this.rdbgInfoBaseAlias,
 				idOfDebuggerUi: this.debuggerId,
 			});
+
+			// Пинг целей rtgt для обновления rteProcVersion (для RemoteDebuggerRunTime)
+			const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
+			for (const t of this.targets) {
+				const seanceId = t.seanceId ?? '';
+				if (!seanceId && !this.rteProcVersionByTargetId.has(t.id)) continue;
+				void this.rdbgClient.pingDBGTGT(base, t.id, seanceId, this.rteProcVersionByTargetId.get(t.id))
+					.then((res) => {
+						if (res.rteProcVersion) this.rteProcVersionByTargetId.set(t.id, res.rteProcVersion);
+					})
+					.catch(() => {});
+			}
+
 			if (!result) return;
+
+			// exprEvaluated — для variablesRequest (retry evalLocalVariables конкурирует с pollPing за ping)
+			for (const ev of result.exprEvaluated ?? []) {
+				if (ev.expressionResultID && ev.result) {
+					this.exprEvaluatedStore.set(ev.expressionResultID, ev.result);
+				}
+			}
 
 			// Событие targetStarted — новая цель отладки (как в onec-debug-adapter DebugTargetsManager)
 			if (result.targetStarted) {
-				const newTargets: DebugTargetId[] = [];
-				for (const target of result.targetStarted) {
+				const toAdd = result.targetStarted.filter((target) => {
 					if (this.autoAttachTypes.length > 0) {
 						const tt = target.targetType ?? '';
-						if (tt.trim() && !matchesAutoAttachType(tt, this.autoAttachTypes)) continue;
+						if (tt.trim() && !matchesAutoAttachType(tt, this.autoAttachTypes)) return false;
 					}
-					const exists = this.targets.some(t => t.id === target.id);
-					if (!exists) {
-						this.targets.push(target);
-						newTargets.push(target);
-					}
-				}
+					return !this.targets.some((t) => t.id === target.id);
+				});
+				const merged = this.deduplicateTargetsById([...this.targets, ...toAdd]);
+				const newTargets = merged.filter((t) => !this.targets.some((existing) => existing.id === t.id));
+				this.targets = merged;
 				if (newTargets.length > 0) {
 					await this.attachToTargets(newTargets);
 					const hadPlaceholder = this.targets.length === newTargets.length;
@@ -376,12 +457,12 @@ export class OnecDebugSession extends DebugSession {
 				}
 			}
 
-			// Событие targetQuit — цель отладки завершилась
 			if (result.targetQuit) {
 				for (const target of result.targetQuit) {
 					const index = this.targets.findIndex(t => t.id === target.id);
 					if (index >= 0) {
 						this.targets.splice(index, 1);
+						this.rteProcVersionByTargetId.delete(target.id);
 						const threadId = this.getThreadIdByTargetId(target.id);
 						this.sendEvent(new ThreadEvent('exited', threadId));
 						this.sendEvent(new OutputEvent(
@@ -392,40 +473,35 @@ export class OnecDebugSession extends DebugSession {
 				}
 			}
 
-			// Событие callStackFormed — останов на брейкпойнте/шаге. Сразу показываем остановку по стеку из ping, getCallStack — в фоне (чтобы не блокировать UI).
+			// Событие callStackFormed — останов на брейкпойнте/шаге. StoppedEvent переводит IDE в состояние paused (F10/F11).
 			if (result.callStackFormed) {
 				const csf = result.callStackFormed;
-				const effectiveTargetId = (csf.targetId && csf.targetId.trim()) || this.targets[0]?.id || '';
-				const threadId = effectiveTargetId ? this.getThreadIdByTargetId(effectiveTargetId) : 1;
-				const stackFromPing = csf.callStack;
-				this.threadsCallStack.set(threadId, stackFromPing);
-				this.cancelPendingStackRefresh(threadId);
-				this.localsCache.clear();
-				this.clearEvalExprCache();
-				const reason = csf.reason === 'Breakpoint' ? 'breakpoint' : csf.reason === 'Exception' ? 'exception' : 'step';
-				this.sendEvent(new OutputEvent(
-					`[DEBUG] Остановка (${reason}), кадров: ${stackFromPing.length}, переключение на панель отладки.\n`,
-					'console',
-				));
-				void vscode.commands.executeCommand('workbench.view.debug');
-				this.sendEvent(new StoppedEvent(reason, threadId));
-				this.revealCurrentFrameInEditor(threadId);
-				// В фоне запрашиваем полный стек (номера строк, moduleId). Обновляем вид только если стек реально изменился — иначе не слать InvalidatedEvent, чтобы не терять контекст и не вызывать лишние запросы переменных.
-				if (this.rdbgClient && effectiveTargetId) {
-					void this.rdbgClient.getCallStack(
-						{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-						{ id: effectiveTargetId },
-					).then((fullStack) => {
-						if (fullStack.length === 0) return;
-						const current = this.threadsCallStack.get(threadId) ?? [];
-						if (this.isCallStackEqual(current, fullStack)) return;
-						this.threadsCallStack.set(threadId, fullStack);
-						this.localsCache.clear();
-						this.clearEvalExprCache();
-						this.sendEvent(new InvalidatedEvent(['stack']));
-						this.revealCurrentFrameInEditor(threadId);
-					}).catch(() => {});
+				let threadId = 1;
+				if (csf.targetId?.trim()) {
+					threadId = this.getThreadIdByTargetId(csf.targetId);
+				} else if (csf.targetIDStr && this.targets.length > 0) {
+					const target = this.targets.find((t) => t.targetIDStr === csf.targetIDStr);
+					if (target) {
+						threadId = this.getThreadIdByTargetId(target.id);
+					}
+				} else if (this.targets.length > 0) {
+					threadId = 1;
 				}
+
+				// Сохраняем targetIDStr в цель — нужен для evalExprStartStop перед step (F10/F11). getDbgTargets часто не отдаёт targetIDStr.
+				if (csf.targetIDStr?.trim()) {
+					const target = this.targets[threadId - 1] ?? this.targets[0];
+					if (target) {
+						target.targetIDStr = csf.targetIDStr;
+					}
+				}
+
+				// Ping отдаёт стек в порядке [current, parent, root]. revealCurrentFrameInEditor использует stack[0]=current.
+				const stackOrdered = csf.callStack;
+				this.threadsCallStack.set(threadId, stackOrdered);
+				this.cancelPendingStackRefresh(threadId);
+				this.sendEvent(new StoppedEvent(csf.reason, threadId));
+				this.revealCurrentFrameInEditor(threadId);
 			}
 		} catch {
 			// игнорируем ошибки опроса
@@ -566,8 +642,8 @@ export class OnecDebugSession extends DebugSession {
 					}
 					// Пауза после ping, затем 1–2 вызова getDbgTargets (сервер может отдавать цели с задержкой)
 					const baseReq = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
-					const applyTargets = (res: { id?: unknown }): void => {
-						const idList = res.id;
+					const applyTargets = (res: { id?: unknown; item?: unknown }): void => {
+						const idList = res.id ?? res.item;
 						const list = Array.isArray(idList) ? idList : idList ? [idList] : [];
 						let filtered = list as DebugTargetId[];
 						if (autoAttachTypes && autoAttachTypes.length > 0) {
@@ -577,7 +653,7 @@ export class OnecDebugSession extends DebugSession {
 								return matchesAutoAttachType(tt, autoAttachTypes);
 							}) as DebugTargetId[];
 						}
-						if (filtered.length > 0) this.targets = filtered;
+						if (filtered.length > 0) this.targets = this.deduplicateTargetsById(filtered);
 					};
 					await new Promise((r) => setTimeout(r, 300));
 					try {
@@ -612,7 +688,7 @@ export class OnecDebugSession extends DebugSession {
 										})
 									: list;
 							if (filtered.length > 0) {
-								this.targets = filtered;
+								this.targets = this.deduplicateTargetsById(filtered);
 								await this.attachToTargets(this.targets);
 								this.sendEvent(new OutputEvent(
 									`[DEBUG] Ожидание целей: найдено ${this.targets.length}\n`,
@@ -649,7 +725,7 @@ export class OnecDebugSession extends DebugSession {
 										})
 									: list;
 							if (filtered.length > 0) {
-								this.targets = filtered;
+								this.targets = this.deduplicateTargetsById(filtered);
 								// В launch: подождать и запросить цели ещё раз — ManagedClient может подключиться чуть позже ServerEmulation
 								await new Promise((r) => setTimeout(r, 800));
 								try {
@@ -666,11 +742,7 @@ export class OnecDebugSession extends DebugSession {
 													return matchesAutoAttachType(tt, autoAttachTypes);
 												})
 											: (list2 as DebugTargetId[]);
-									for (const t of filtered2) {
-										if (!this.targets.some((existing) => existing.id === t.id)) {
-											this.targets.push(t);
-										}
-									}
+									this.targets = this.deduplicateTargetsById([...this.targets, ...filtered2]);
 								} catch {
 									// игнорируем
 								}
@@ -745,6 +817,8 @@ export class OnecDebugSession extends DebugSession {
 	): Promise<void> {
 		this.stopPingPolling();
 		this.clearEvalExprCache();
+		this.targets = [];
+		this.rteProcVersionByTargetId.clear();
 		// В launch-режиме всегда завершаем процесс 1cv8c (как onec-debug-adapter)
 		if (this.launchedProcess && (args.terminateDebuggee !== false)) {
 			try {
@@ -870,11 +944,12 @@ export class OnecDebugSession extends DebugSession {
 
 		if (this.attached && this.rdbgClient) {
 			try {
-				await this.rdbgClient.setBreakpoints({
+				const setBpRes = await this.rdbgClient.setBreakpoints({
 					infoBaseAlias: this.rdbgInfoBaseAlias,
 					idOfDebuggerUi: this.debuggerId,
 					bpWorkspace,
 				});
+				if (setBpRes.bpVersion) this.lastBpVersion = setBpRes.bpVersion;
 			} catch (err) {
 				const msg = err instanceof Error ? err.message : String(err);
 				response.body = {
@@ -908,6 +983,7 @@ export class OnecDebugSession extends DebugSession {
 		const stackFrames: StackFrame[] = [];
 
 		if (stack.length > 0) {
+			// frameId = threadId*10000 + 1000 + i — иначе при двух потоках frameId совпадают, переменные путаются
 			for (let i = startFrame; i < Math.min(startFrame + maxLevels, stack.length); i++) {
 				const item = stack[i];
 				const line = typeof item.lineNo === 'number' ? item.lineNo : parseInt(String(item.lineNo ?? 0), 10) || 1;
@@ -916,7 +992,13 @@ export class OnecDebugSession extends DebugSession {
 				if (item.moduleId?.objectId && item.moduleId?.propertyId) {
 					sourcePath = getModulePathByObjectProperty(root, item.moduleId.objectId, item.moduleId.propertyId);
 				}
-				const frameId = 1000 + i;
+				if (!sourcePath && item.moduleIdStr?.trim()) {
+					sourcePath = getModulePathByModuleIdStr(root, item.moduleIdStr);
+				}
+				if (sourcePath && !path.isAbsolute(sourcePath)) {
+					sourcePath = path.resolve(root, sourcePath);
+				}
+				const frameId = threadId * 10000 + 1000 + i;
 				// Источник: путь к файлу или имя по moduleIdStr. Не используем moduleIdStr, если строка похожа на бинарные данные — иначе IDE показывает "Could not load source '@мусор'".
 				const safeModuleIdStr = isSafeSourceDisplayName(item.moduleIdStr) ? item.moduleIdStr : undefined;
 				const src = sourcePath
@@ -940,9 +1022,11 @@ export class OnecDebugSession extends DebugSession {
 		_request?: DebugProtocol.Request,
 	): void {
 		const frameId = args.frameId;
-		// Регистрируем scope для локальных переменных, сохраняем frameId
-		const frameIndex = frameId >= 1000 ? frameId - 1000 : 0;
-		const localScopeRef = this.references.registerVariable('locals', { frameIndex });
+		// frameId = threadId*10000 + 1000 + i
+		const threadId = frameId >= 10000 ? Math.floor(frameId / 10000) : 1;
+		const frameIndex = frameId >= 1000 ? ((frameId % 10000) - 1000) : 0;
+		const safeFrameIndex = frameIndex >= 0 ? frameIndex : 0;
+		const localScopeRef = this.references.registerVariable('locals', { frameIndex: safeFrameIndex, threadId });
 		response.body = {
 			scopes: [
 				{
@@ -955,102 +1039,116 @@ export class OnecDebugSession extends DebugSession {
 		this.sendResponse(response);
 	}
 
+	/** Сообщение сервера 400: вычисления только в остановленном предмете. При такой ошибке возвращаем кэш или пустой список, не показываем ошибку. */
+	private static isEvalOnlyWhenStoppedError(err: unknown): boolean {
+		const msg = err instanceof Error ? err.message : String(err ?? '');
+		return /400|остановленном предмете отладки|вычислений возможно только/i.test(msg);
+	}
+
 	protected override async variablesRequest(
 		response: DebugProtocol.VariablesResponse,
 		args: DebugProtocol.VariablesArguments,
 		_request?: DebugProtocol.Request,
 	): Promise<void> {
-		const varInfo = this.references.getVariable(args.variablesReference);
-		if (!varInfo) {
-			response.body = { variables: [] };
+		let responseSent = false;
+		const sendOnce = (body: { variables: DebugProtocol.Variable[] }) => {
+			if (responseSent) return;
+			responseSent = true;
+			response.body = body;
 			this.sendResponse(response);
-			return;
-		}
-
-		// Результат раскрытия выражения из Watch (evalExpr с children), в т.ч. вложенные уровни (Структура, Параметры и т.д.)
-		const val = varInfo.value as {
-			type?: string;
-			children?: Array<{ name: string; value: string; typeName?: string }>;
-			expression?: string;
-			frameIndex?: number;
 		};
-		if (val?.type === 'evalChildren') {
-			const frameIndex = val.frameIndex ?? 0;
-			const parentExpr = varInfo.path.replace(/^eval:/, '');
-			if (val.expression && (!val.children || val.children.length === 0) && this.rdbgClient && this.attached) {
-				const target = this.targets[0];
-				if (target) {
-					const nestedCacheKey = `${target.id}:${frameIndex}:${val.expression}`;
-					try {
-						const result = await this.rdbgClient.evalExpr(
-							{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-							{ id: target.id },
-							val.expression,
-							frameIndex,
-						);
-						if (result.children && result.children.length > 0) {
-							val.children = result.children;
-						} else {
+		try {
+			const varInfo = this.references.getVariable(args.variablesReference);
+			if (!varInfo) {
+				sendOnce({ variables: [] });
+				return;
+			}
+
+			// Результат раскрытия выражения из Watch (evalExpr с children), в т.ч. вложенные уровни (Структура, Параметры и т.д.)
+			const val = varInfo.value as {
+				type?: string;
+				children?: Array<{ name: string; value: string; typeName?: string }>;
+				expression?: string;
+				frameIndex?: number;
+				threadId?: number;
+			};
+			if (val?.type === 'evalChildren') {
+				const frameIndex = val.frameIndex ?? 0;
+				const threadId = val.threadId ?? 1;
+				const parentExpr = varInfo.path.replace(/^eval:/, '');
+				if (val.expression && (!val.children || val.children.length === 0) && this.rdbgClient && this.attached) {
+					const target = this.targets[threadId - 1] ?? this.targets[0];
+					if (target) {
+						const nestedCacheKey = `${target.id}:${frameIndex}:${val.expression}`;
+						try {
+							const result = await this.rdbgClient.evalExpr(
+								{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+								{ id: target.id },
+								val.expression,
+								frameIndex,
+							);
+							if (result.children && result.children.length > 0) {
+								val.children = result.children;
+							} else {
+								const cachedNested = this.evalExprCache.get(nestedCacheKey);
+								if (cachedNested?.children && cachedNested.children.length > 0) {
+									val.children = cachedNested.children;
+								}
+							}
+						} catch (e) {
+							// 400 «только в остановленном предмете» — отдаём кэш или пустых детей, чтобы колесо не крутилось
 							const cachedNested = this.evalExprCache.get(nestedCacheKey);
 							if (cachedNested?.children && cachedNested.children.length > 0) {
 								val.children = cachedNested.children;
 							}
 						}
-					} catch {
-						const cachedNested = this.evalExprCache.get(nestedCacheKey);
-						if (cachedNested?.children && cachedNested.children.length > 0) {
-							val.children = cachedNested.children;
-						}
 					}
 				}
-			}
-			const childrenList = Array.isArray(val.children) ? val.children : [];
-			const expandableTypes = new Set(['Структура', 'Соответствие', 'Массив', 'СписокЗначений', 'ТаблицаЗначений', 'Запрос', 'РезультатЗапроса', 'ДеревоЗначений', 'ХранилищеЗначения', 'БинарныеДанные', 'КартаКартинок', 'Объект', 'Ссылка', 'ПланВидовХарактеристик', 'ПланСчетов', 'РегистрСведений', 'РегистрНакопления', 'ДокументОбъект', 'ДокументСсылка', 'ПеречислениеСсылка']);
-			const isExpandable = (typeName?: string) => {
-				const t = (typeName ?? '').trim();
-				if (!t) return false;
-				if (/^(Число|Строка|Булево|Дата|Неопределено|Null|УникальныйИдентификатор)$/i.test(t)) return false;
-				return true;
-			};
-			const variables = childrenList.map((c) => {
-				const expandable = isExpandable(c.typeName);
-				let variablesReference = 0;
-				if (expandable && parentExpr) {
-					const nestedExpr = parentExpr.includes('.') ? `${parentExpr}.${c.name}` : `${parentExpr}.${c.name}`;
-					variablesReference = this.references.registerVariable(`eval:${nestedExpr}`, {
-						type: 'evalChildren',
-						expression: nestedExpr,
-						frameIndex,
-						children: [],
-					});
-				}
-				return {
-					name: c.name,
-					value: c.value,
-					type: c.typeName,
-					variablesReference,
+				const childrenList = Array.isArray(val.children) ? val.children : [];
+				const isExpandable = (typeName?: string) => {
+					const t = (typeName ?? '').trim();
+					if (!t) return false;
+					if (/^(Число|Строка|Булево|Дата|Неопределено|Null|УникальныйИдентификатор)$/i.test(t)) return false;
+					return true;
 				};
-			});
-			response.body = { variables };
-			this.sendResponse(response);
-			return;
-		}
+				const variables = childrenList.map((c) => {
+					const expandable = isExpandable(c.typeName);
+					let variablesReference = 0;
+					if (expandable && parentExpr) {
+						const nestedExpr = parentExpr.includes('.') ? `${parentExpr}.${c.name}` : `${parentExpr}.${c.name}`;
+						variablesReference = this.references.registerVariable(`eval:${nestedExpr}`, {
+							type: 'evalChildren',
+							expression: nestedExpr,
+							frameIndex,
+							threadId: val.threadId ?? 1,
+							children: [],
+						});
+					}
+					return {
+						name: c.name,
+						value: c.value,
+						type: c.typeName,
+						variablesReference,
+					};
+				});
+				sendOnce({ variables });
+				return;
+			}
 
-		// Локальные переменные (scope «Локальные»)
-		if (!this.rdbgClient || !this.attached) {
-			response.body = { variables: [] };
-			this.sendResponse(response);
-			return;
-		}
-		const target = this.targets[0];
-		if (!target) {
-			response.body = { variables: [] };
-			this.sendResponse(response);
-			return;
-		}
+			// Локальные переменные (scope «Локальные»)
+			if (!this.rdbgClient || !this.attached) {
+				sendOnce({ variables: [] });
+				return;
+			}
+			const scopeVal = varInfo.value as { frameIndex?: number; threadId?: number };
+			const frameIndex = Math.max(0, scopeVal?.frameIndex ?? 0);
+			const threadId = scopeVal?.threadId ?? 1;
+			const target = this.targets[threadId - 1] ?? this.targets[0];
+			if (!target) {
+				sendOnce({ variables: [] });
+				return;
+			}
 
-		try {
-			const frameIndex = (varInfo.value as { frameIndex?: number })?.frameIndex ?? 0;
 			const localsCacheKey = `${target.id}:${frameIndex}`;
 
 			const isExpandableType = (typeName?: string): boolean => {
@@ -1071,21 +1169,73 @@ export class OnecDebugSession extends DebugSession {
 							type: 'evalChildren',
 							expression: v.name,
 							frameIndex,
+							threadId,
 							children: [],
 						});
 					}
 					return { name: v.name, value: v.value, type: v.type, variablesReference };
 				});
-				response.body = { variables };
-				this.sendResponse(response);
+				sendOnce({ variables });
 				return;
 			}
 
-			const result = await this.rdbgClient.evalLocalVariables(
-				{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-				{ id: target.id },
-				frameIndex,
-			);
+			const exprStore: ExprEvaluatedStore = {
+				take: (id) => {
+					const r = this.exprEvaluatedStore.get(id);
+					if (r) this.exprEvaluatedStore.delete(id);
+					return r;
+				},
+			};
+			let result: { variables: Array<{ name: string; value: string; typeName?: string }> };
+			try {
+				result = await this.rdbgClient.evalLocalVariables(
+					{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+					{ id: target.id },
+					frameIndex,
+					exprStore,
+				);
+				// При пустом ответе и пустом кэше — один повтор через 80 ms (результат может прийти в ping)
+				if (result.variables.length === 0 && !this.localsCache.get(localsCacheKey)?.length) {
+					await new Promise((r) => setTimeout(r, 80));
+					result = await this.rdbgClient.evalLocalVariables(
+						{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+						{ id: target.id },
+						frameIndex,
+						exprStore,
+					);
+				}
+			} catch (err) {
+				// 400 «выполнение вычислений возможно только в остановленном предмете отладки» — отдаём кэш или пустой список, чтобы колесо не крутилось
+				if (OnecDebugSession.isEvalOnlyWhenStoppedError(err)) {
+					const cachedLocals = this.localsCache.get(localsCacheKey);
+					const variables = (cachedLocals ?? []).map((v) => {
+						const expandable = isExpandableType(v.type);
+						let variablesReference = 0;
+						if (expandable) {
+							variablesReference = this.references.registerVariable(`eval:${v.name}`, {
+								type: 'evalChildren',
+								expression: v.name,
+								frameIndex,
+								threadId,
+								children: [],
+							});
+						}
+						return { name: v.name, value: v.value, type: v.type, variablesReference };
+					});
+					sendOnce({ variables });
+					return;
+				}
+				sendOnce({
+					variables: [
+						{
+							name: 'Ошибка',
+							value: `Не удалось получить переменные: ${err instanceof Error ? err.message : String(err)}`,
+							variablesReference: 0,
+						},
+					],
+				});
+				return;
+			}
 
 			let variables = result.variables.map(v => {
 				const expandable = isExpandableType(v.typeName);
@@ -1095,6 +1245,7 @@ export class OnecDebugSession extends DebugSession {
 						type: 'evalChildren',
 						expression: v.name,
 						frameIndex,
+						threadId,
 						children: [],
 					});
 				}
@@ -1119,15 +1270,15 @@ export class OnecDebugSession extends DebugSession {
 								type: 'evalChildren',
 								expression: v.name,
 								frameIndex,
+								threadId,
 								children: [],
 							});
 						}
 						return { ...v, variablesReference };
 					});
 				} else {
-					const stacks = Array.from(this.threadsCallStack.entries());
-					const stack = stacks[0]?.[1];
-					const item = stack?.[frameIndex];
+					const stack = this.threadsCallStack.get(threadId) ?? [];
+					const item = stack[frameIndex];
 					if (item?.moduleId && typeof item.lineNo !== 'undefined') {
 						const objectId = item.moduleId.objectId ?? '';
 						const propertyId = item.moduleId.propertyId ?? '';
@@ -1147,24 +1298,33 @@ export class OnecDebugSession extends DebugSession {
 				}
 			}
 
-			response.body = { variables };
-			// Сразу в фоне запрашиваем evalExpr по всем раскрываемым переменным — при раскрытии в панели данные уже будут в кэше
+			sendOnce({ variables });
+			// Один батч-запрос по всем раскрываемым переменным (вместо N отдельных evalExpr) — при раскрытии данные уже в кэше
 			const expandableNames = result.variables.filter((v) => isExpandableType(v.typeName)).map((v) => v.name);
 			if (expandableNames.length > 0) {
-				this.prefetchLocalsChildren(target.id, frameIndex, expandableNames);
+				void this.rdbgClient.evalLocalVariablesBatch(
+					{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+					{ id: target.id },
+					frameIndex,
+					expandableNames,
+					exprStore,
+				).then((batch) => {
+					for (const [expr, evalResult] of Object.entries(batch.childrenByExpression)) {
+						this.evalExprCache.set(`${target.id}:${frameIndex}:${expr}`, {
+							result: evalResult.result ?? '',
+							typeName: evalResult.typeName,
+							children: evalResult.children,
+							variablesRef: 0,
+						});
+					}
+				}).catch(() => {});
 			}
-		} catch (err) {
-			response.body = {
-				variables: [
-					{
-						name: 'Ошибка',
-						value: `Не удалось получить переменные: ${err instanceof Error ? err.message : String(err)}`,
-						variablesReference: 0,
-					},
-				],
-			};
+		} finally {
+			if (!responseSent) {
+				response.body = { variables: [] };
+				this.sendResponse(response);
+			}
 		}
-		this.sendResponse(response);
 	}
 
 	protected override async continueRequest(
@@ -1215,12 +1375,18 @@ export class OnecDebugSession extends DebugSession {
 		if (!target?.id) {
 			return;
 		}
+		const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
 		try {
-			await this.rdbgClient.step(
-				{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-				{ id: target.id },
-				action,
-			);
+			// Как Конфигуратор 1С: rdbg setBreakOnNextStatement перед step — не требует targetIDStr.
+			if (action !== 'Continue') {
+				try {
+					await this.rdbgClient.setBreakOnNextStatement(base);
+				} catch {
+					// игнорируем
+				}
+			}
+			const stepResponse = await this.rdbgClient.step(base, { id: target.id }, action);
+			this.mergeTargetIDStrFromResponse(stepResponse);
 		} catch {
 			// игнорируем ошибки шага
 		}

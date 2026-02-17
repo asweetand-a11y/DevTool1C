@@ -31,12 +31,19 @@ import type {
 	EvalLocalVariablesResult,
 	EvalLocalVariablesBatchResult,
 	LocalVariable,
+	ExprEvaluatedStore,
 	InitialDebugSettings,
 	AttachDetachTargetsCommand,
 	AutoAttachSettings,
+	PingDBGTGTResult,
+	RemoteDebuggerEnvState,
 } from './rdbgTypes';
+import * as iconv from 'iconv-lite';
 import { XMLParser } from 'fast-xml-parser';
 import { NS, ResponseSchema, DbguiExtCmds } from './xdtoSchema';
+
+/** Кодировка запросов к серверу отладки 1С: при true — Windows-1251 (кириллица в evalExpr), иначе UTF-8. Ответы всегда декодируем как UTF-8 (имена/значения переменных в панели VARIABLES приходят в UTF-8). */
+const RDBG_REQUEST_WINDOWS_1251 = true;
 
 function buildBaseRequestXml(base: RDbgBaseRequest): string {
 	return `<infoBaseAlias>${escapeXml(base.infoBaseAlias)}</infoBaseAlias><idOfDebuggerUI>${escapeXml(base.idOfDebuggerUi)}</idOfDebuggerUI>`;
@@ -64,7 +71,7 @@ function buildStepRequestBody(base: RDbgBaseRequest, targetId: DebugTargetIdLigh
 		`</request>`;
 }
 
-/** Формат getCallStack по трафику Конфигуратора: default NS debugBaseData, элементы с префиксом debugRDBGRequestResponse, элемент id (не targetID), один idOfDebuggerUI. */
+/** Тело запроса getCallStack. Как step/evalLocalVariables: debugBaseData + targetID с префиксом (сервер 8.3.27 ожидает targetID, не id). */
 function buildGetCallStackRequestBody(base: RDbgBaseRequest, targetId: DebugTargetIdLight): string {
 	const alias = escapeXml(base.infoBaseAlias);
 	const dbgui = escapeXml(base.idOfDebuggerUi);
@@ -72,8 +79,42 @@ function buildGetCallStackRequestBody(base: RDbgBaseRequest, targetId: DebugTarg
 	return `<?xml version="1.0" encoding="UTF-8"?><request ${STEP_REQUEST_NAMESPACES}>` +
 		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
 		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
-		`<debugRDBGRequestResponse:id><id>${id}</id></debugRDBGRequestResponse:id>` +
+		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
 		`</request>`;
+}
+
+/** Формат clearBreakOnNextStatement/setBreakOnNextStatement по трафику Конфигуратора: debugBaseData + префикс debugRDBGRequestResponse, один idOfDebuggerUI. */
+function buildBreakOnNextStatementBody(base: RDbgBaseRequest): string {
+	const alias = escapeXml(base.infoBaseAlias);
+	const dbgui = escapeXml(base.idOfDebuggerUi);
+	return `<?xml version="1.0" encoding="UTF-8"?><request ${STEP_REQUEST_NAMESPACES}>` +
+		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
+		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
+		`</request>`;
+}
+
+/** Формат attachDetachDbgTargets по трафику Конфигуратора: debugBaseData + префикс, attach, id с вложенным id. */
+function buildAttachDetachDbgTargetsBody(base: RDbgBaseRequest, command: AttachDetachTargetsCommand): string {
+	const alias = escapeXml(base.infoBaseAlias);
+	const dbgui = escapeXml(base.idOfDebuggerUi);
+	const q = 'debugRDBGRequestResponse';
+	let attachIdBlocks = '';
+	if (command.attach && command.attach.length > 0) {
+		attachIdBlocks += `<${q}:attach>true</${q}:attach>`;
+		for (const id of command.attach) {
+			attachIdBlocks += `<${q}:id><id>${escapeXml(id)}</id></${q}:id>`;
+		}
+	}
+	if (command.detach && command.detach.length > 0) {
+		attachIdBlocks += `<${q}:attach>false</${q}:attach>`;
+		for (const id of command.detach) {
+			attachIdBlocks += `<${q}:id><id>${escapeXml(id)}</id></${q}:id>`;
+		}
+	}
+	return `<?xml version="1.0" encoding="UTF-8"?><request ${STEP_REQUEST_NAMESPACES}>` +
+		`<${q}:infoBaseAlias>${alias}</${q}:infoBaseAlias>` +
+		`<${q}:idOfDebuggerUI>${dbgui}</${q}:idOfDebuggerUI>` +
+		`${attachIdBlocks}</request>`;
 }
 
 /** Формат evalLocalVariables/evalExpr по трафику Конфигуратора: expr с srcCalcInfo (expressionID, expressionResultID, interfaces=context), для evalExpr — calcItem. */
@@ -132,6 +173,7 @@ function buildEvalExprRequestBody(
 		`<debugCalculations:calcItem><debugCalculations:itemType>expression</debugCalculations:itemType><debugCalculations:expression>${exprText}</debugCalculations:expression></debugCalculations:calcItem>` +
 		`<debugCalculations:interfaces>context</debugCalculations:interfaces>` +
 		`</debugCalculations:srcCalcInfo>` +
+		`<debugCalculations:presOptions><debugCalculations:maxTextSize>10240</debugCalculations:maxTextSize></debugCalculations:presOptions>` +
 		`</debugRDBGRequestResponse:expr>`;
 	const body = `<?xml version="1.0" encoding="UTF-8"?><request ${EVAL_LOCAL_NAMESPACES}>` +
 		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
@@ -194,6 +236,75 @@ function buildEvalLocalVariablesBatchRequestBody(
 		exprBlocks.join('') +
 		`</request>`;
 	return { body, expressionResultIDs };
+}
+
+const RTGT_NS = NS.dbgtgtRemoteRequestResponse;
+
+/** Тело запроса rtgt?cmd=pingDBGTGT: data с rteProcVersion, infoBaseAlias, seanceID, targetID. */
+function buildRtgtPingRequestBody(
+	base: RDbgBaseRequest,
+	targetId: string,
+	seanceId: string,
+	rteProcVersion?: string,
+): string {
+	const alias = escapeXml(base.infoBaseAlias);
+	const sid = escapeXml(seanceId);
+	const tid = escapeXml(targetId);
+	const rte = rteProcVersion != null && rteProcVersion !== '' ? escapeXml(rteProcVersion) : '';
+	const dataContent =
+		`<data xmlns="${RTGT_NS}">` +
+		`<infoBaseAlias>${alias}</infoBaseAlias>` +
+		`<seanceID>${sid}</seanceID>` +
+		`<targetID>${tid}</targetID>` +
+		(rte ? `<rteProcVersion>${rte}</rteProcVersion>` : '') +
+		`</data>`;
+	return `<?xml version="1.0" encoding="UTF-8"?><request xmlns="${RTGT_NS}">${dataContent}</request>`;
+}
+
+/** Тело запроса rtgt?cmd=startDBGTGT: infoBaseAlias, idOfDebuggerUI = target id. */
+function buildRtgtStartRequestBody(base: RDbgBaseRequest, targetId: string): string {
+	const alias = escapeXml(base.infoBaseAlias);
+	const id = escapeXml(targetId);
+	return `<?xml version="1.0" encoding="UTF-8"?><request xmlns="${RTGT_NS}"><infoBaseAlias>${alias}</infoBaseAlias><idOfDebuggerUI>${id}</idOfDebuggerUI></request>`;
+}
+
+const RDRT_NS = NS.dbgtgtRemoteRequestResponse;
+
+/** Формат запроса RemoteDebuggerRunTime по трафику Конфигуратора (D:\traf): default NS debugBaseData, элементы с префиксом dbgtgtRemoteRequestResponse. */
+const RDRT_REQUEST_NAMESPACES =
+	`xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:dbgtgtRemoteRequestResponse="${RDRT_NS}" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"`;
+
+/** Тело запроса RemoteDebuggerRunTime?cmd=register: infoBaseAlias, targetIDStr, setDefDbgToThisSeance. */
+function buildRemoteDebuggerRunTimeRegisterBody(base: RDbgBaseRequest, targetIDStr: string, setDefDbgToThisSeance: boolean): string {
+	const alias = escapeXml(base.infoBaseAlias);
+	const tid = escapeXml(targetIDStr);
+	const val = setDefDbgToThisSeance ? 'true' : 'false';
+	const p = 'dbgtgtRemoteRequestResponse';
+	return `<?xml version="1.0" encoding="UTF-8"?><request ${RDRT_REQUEST_NAMESPACES}>` +
+		`<${p}:infoBaseAlias>${alias}</${p}:infoBaseAlias>` +
+		`<${p}:targetIDStr>${tid}</${p}:targetIDStr>` +
+		`<${p}:setDefDbgToThisSeance>${val}</${p}:setDefDbgToThisSeance>` +
+		`</request>`;
+}
+
+/** Тело запроса RemoteDebuggerRunTime?cmd=evalExprStartStop: infoBaseAlias, targetIDStr, envState (breakOnNextLine, bpVersion, rteProcVersion). */
+function buildEvalExprStartStopBody(base: RDbgBaseRequest, targetIDStr: string, envState: RemoteDebuggerEnvState): string {
+	const alias = escapeXml(base.infoBaseAlias);
+	const tid = escapeXml(targetIDStr);
+	const breakOnNext = envState.breakOnNextLine === true ? 'true' : 'false';
+	const bpVer = envState.bpVersion != null && envState.bpVersion !== '' ? escapeXml(envState.bpVersion) : '';
+	const rteVer = envState.rteProcVersion != null && envState.rteProcVersion !== '' ? escapeXml(envState.rteProcVersion) : '';
+	const p = 'dbgtgtRemoteRequestResponse';
+	const envXml =
+		`<${p}:envState>` +
+		`<${p}:breakOnNextLine>${breakOnNext}</${p}:breakOnNextLine>` +
+		(bpVer ? `<${p}:bpVersion>${bpVer}</${p}:bpVersion>` : '') +
+		(rteVer ? `<${p}:rteProcVersion>${rteVer}</${p}:rteProcVersion>` : '') +
+		`</${p}:envState>`;
+	return `<?xml version="1.0" encoding="UTF-8"?><request ${RDRT_REQUEST_NAMESPACES}>` +
+		`<${p}:infoBaseAlias>${alias}</${p}:infoBaseAlias>` +
+		`<${p}:targetIDStr>${tid}</${p}:targetIDStr>` +
+		`${envXml}</request>`;
 }
 
 function buildRequestInfoXml(base: RDbgBaseRequest): string {
@@ -282,16 +393,19 @@ function getTargetIdFromResult(obj: Record<string, unknown>): string {
 	return '';
 }
 
-/** Нормализует цель отладки из XML (getDbgTargets/ping targetStarted). */
+/** Нормализует цель отладки из XML (getDbgTargets/step item или ping targetStarted). Поддерживает вид item с targetID и targetIDStr (как в ответе step/getDbgTargets). */
 function parseDebugTargetFromXml(t: unknown): DebugTargetId {
 	if (!t || typeof t !== 'object') return { id: '' };
 	const o = t as Record<string, unknown>;
-	const id = String(o.id ?? o.Id ?? '');
-	const seanceId = o.seanceId ?? o.SeanceId;
-	const seanceNo = o.seanceNo ?? o.SeanceNo;
-	const targetType = o.targetType ?? o.TargetType;
-	const userName = o.userName ?? o.UserName;
-	const infoBaseAlias = o.infoBaseAlias ?? o.InfoBaseAlias;
+	const targetIdNode = o.targetID ?? o.TargetID;
+	const flat = targetIdNode && typeof targetIdNode === 'object' ? (targetIdNode as Record<string, unknown>) : o;
+	const id = String(flat.id ?? flat.Id ?? o.id ?? o.Id ?? '');
+	const seanceId = flat.seanceId ?? flat.SeanceId ?? o.seanceId ?? o.SeanceId;
+	const seanceNo = flat.seanceNo ?? flat.SeanceNo ?? o.seanceNo ?? o.SeanceNo;
+	const targetType = flat.targetType ?? flat.TargetType ?? o.targetType ?? o.TargetType;
+	const userName = flat.userName ?? flat.UserName ?? o.userName ?? o.UserName;
+	const infoBaseAlias = flat.infoBaseAlias ?? flat.InfoBaseAlias ?? o.infoBaseAlias ?? o.InfoBaseAlias;
+	const targetIDStr = o.targetIDStr ?? o.TargetIDStr ?? o.TargetIdStr;
 	return {
 		id,
 		seanceId: seanceId != null ? String(seanceId) : undefined,
@@ -299,6 +413,7 @@ function parseDebugTargetFromXml(t: unknown): DebugTargetId {
 		targetType: targetType != null ? String(targetType) : undefined,
 		userName: userName != null ? String(userName) : undefined,
 		infoBaseAlias: infoBaseAlias != null ? String(infoBaseAlias) : undefined,
+		targetIDStr: targetIDStr != null && String(targetIDStr).trim() !== '' ? String(targetIDStr).trim() : undefined,
 	};
 }
 
@@ -339,7 +454,7 @@ function buildSetBreakpointsBody(req: RdbgSetBreakpointsRequest): string {
 		);
 	}
 	return `<?xml version="1.0" encoding="UTF-8"?>` +
-		`<request xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:debugBreakpoints="${NS.debugBreakpoints}" xmlns:debugRDBGRequestResponse="${NS.debugRDBGRequestResponse}" xmlns:v8="http://v8.1c.ru/8.3/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="${NS.xsi}">` +
+		`<request xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:debugBreakpoints="${NS.debugBreakpoints}" xmlns:debugRDBGRequestResponse="${NS.debugRDBGRequestResponse}" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="${NS.xsi}">` +
 		`<${q}:infoBaseAlias>${escapeXml(req.infoBaseAlias)}</${q}:infoBaseAlias>` +
 		`<${q}:idOfDebuggerUI>${escapeXml(req.idOfDebuggerUi)}</${q}:idOfDebuggerUI>` +
 		`<${q}:bpWorkspace>${parts.join('')}</${q}:bpWorkspace>` +
@@ -442,7 +557,7 @@ export class RdbgClient {
 	private async postXml(
 		cmd: string,
 		body: string,
-		options?: { endpoint?: 'rdbg' | 'rdng'; skipDumpOnError?: boolean; queryParams?: Record<string, string>; logCmd?: string },
+		options?: { endpoint?: 'rdbg' | 'rdng' | 'rtgt' | 'RemoteDebuggerRunTime'; skipDumpOnError?: boolean; queryParams?: Record<string, string>; logCmd?: string },
 	): Promise<string> {
 		const endpoint = options?.endpoint ?? 'rdbg';
 		const skipDumpOnError = options?.skipDumpOnError ?? false;
@@ -452,7 +567,12 @@ export class RdbgClient {
 		for (const [k, v] of Object.entries(options?.queryParams ?? {})) {
 			url.searchParams.set(k, v);
 		}
-		const bodyBuf = Buffer.from(body, 'utf8');
+		const bodyBuf = RDBG_REQUEST_WINDOWS_1251
+			? iconv.encode(body, 'win1251')
+			: Buffer.from(body, 'utf8');
+		const contentType = RDBG_REQUEST_WINDOWS_1251
+			? 'application/xml; charset=windows-1251'
+			: 'application/xml; charset=utf-8';
 		return new Promise((resolve, reject) => {
 			const req = http.request(
 				{
@@ -461,7 +581,7 @@ export class RdbgClient {
 					path: url.pathname + url.search,
 					method: 'POST',
 					headers: {
-						'Content-Type': 'application/xml; charset=utf-8',
+						'Content-Type': contentType,
 						'User-Agent': '1CV8',
 						'Content-Length': bodyBuf.length,
 					},
@@ -471,12 +591,14 @@ export class RdbgClient {
 					const chunks: Buffer[] = [];
 					res.on('data', (chunk) => chunks.push(chunk));
 					res.on('end', () => {
-						const text = Buffer.concat(chunks).toString('utf8');
+						const rawBuf = Buffer.concat(chunks);
+						// Ответы (в т.ч. evalLocalVariables) сервер отдаёт в UTF-8 — иначе в панели VARIABLES кириллица отображается кракозябрами.
+						const text = rawBuf.toString('utf8');
 						const statusCode = res.statusCode ?? 0;
-						// Полный протокол — все запросы/ответы в папку temp (кроме ping — слишком много файлов)
-						if (cmd !== 'pingDebugUIParams') {
+						// Полный протокол — все запросы/ответы в папку temp (кроме ping и pingDBGTGT — слишком много файлов)
+						if (cmd !== 'pingDebugUIParams' && cmd !== 'pingDBGTGT') {
 							this.writeProtocolLog(logCmd, url.toString(), body, text, statusCode);
-						} else if (this.logProtocol) {
+						} else if (this.logProtocol && cmd === 'pingDebugUIParams') {
 							// Последний ответ ping — в один файл для отладки пустого call stack
 							this.writePingResponseLog(text);
 						}
@@ -607,11 +729,17 @@ export class RdbgClient {
 		const body = buildRequestBody(buildBaseRequestXml(base) + area);
 		const xml = await this.postXml('getDbgTargets', body);
 		const response = this.parseResponse<Record<string, unknown>>(xml);
-		// XML: <debugRDBGRequestResponse:id> или <id> — парсер может вернуть id или "debugRDBGRequestResponse:id"
-		let raw = response?.id;
+		// Сервер: <response><debugRDBGRequestResponse:id>...</debugRDBGRequestResponse:id></response>; парсер даёт id или debugRDBGRequestResponse:id
+		let raw = response?.id ?? response?.item;
 		if (raw == null && response) {
-			const alt = (response['debugRDBGRequestResponse:id'] ?? response['debugRDBGRequestResponse\\:id']) as unknown;
+			const alt = (response['debugRDBGRequestResponse:id'] ?? response['debugRDBGRequestResponse:item']) as unknown;
 			if (alt != null) raw = alt;
+		}
+		if (raw == null && response && typeof response === 'object') {
+			const key = Object.keys(response).find(
+				(k) => k === 'id' || k === 'item' || /:(id|item)$/i.test(k),
+			);
+			if (key) raw = (response[key] as unknown) ?? undefined;
 		}
 		const list = Array.isArray(raw) ? raw : raw != null ? [raw] : [];
 		const id = list.map((t) => parseDebugTargetFromXml(t));
@@ -632,11 +760,12 @@ export class RdbgClient {
 	}
 
 	/**
-	 * Установка точек останова в сервере отладки 1С.
+	 * Установка точек останова в сервере отладки 1С. Возвращает bpVersion из ответа (для RemoteDebuggerRunTime).
 	 */
-	async setBreakpoints(request: RdbgSetBreakpointsRequest): Promise<void> {
+	async setBreakpoints(request: RdbgSetBreakpointsRequest): Promise<{ bpVersion?: string }> {
 		const body = buildSetBreakpointsBody(request);
-		await this.postXml('setBreakpoints', body);
+		const xml = await this.postXml('setBreakpoints', body);
+		return parseSetBreakpointsResponse(xml);
 	}
 
 	/**
@@ -656,8 +785,8 @@ export class RdbgClient {
 		const parsed = parseEvalExprResult(xml);
 		const hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
 		if (hasContent) return parsed;
-		for (let i = 0; i < 3; i++) {
-			await new Promise((r) => setTimeout(r, 100));
+		for (let i = 0; i < 5; i++) {
+			if (i > 0) await new Promise((r) => setTimeout(r, 80));
 			const pingResult = await this.pingDebugUIParams(base);
 			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
 			if (found) return found.result;
@@ -707,12 +836,57 @@ export class RdbgClient {
 						targetId: '',
 						reason: 'Breakpoint',
 						stopByBp: true,
+						dataBase64: dataBuf.toString('base64'),
 					},
 				};
 				return result;
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * Пинг цели отладки (rtgt?cmd=pingDBGTGT). Возвращает rteProcVersion для использования в RemoteDebuggerRunTime.
+	 */
+	async pingDBGTGT(
+		base: RDbgBaseRequest,
+		targetId: string,
+		seanceId: string,
+		rteProcVersion?: string,
+	): Promise<PingDBGTGTResult> {
+		const body = buildRtgtPingRequestBody(base, targetId, seanceId, rteProcVersion);
+		const raw = await this.postXml('pingDBGTGT', body, { endpoint: 'rtgt', skipDumpOnError: true });
+		const decoded = decodeBase64FromResponse(raw);
+		const xml = decoded.trim() ? decoded : raw;
+		return parsePingDBGTGTResponse(xml);
+	}
+
+	/**
+	 * Старт отладки для цели (rtgt?cmd=startDBGTGT). Вызывать после подключения к цели (attach).
+	 */
+	async startDBGTGT(base: RDbgBaseRequest, targetId: string): Promise<void> {
+		const body = buildRtgtStartRequestBody(base, targetId);
+		await this.postXml('startDBGTGT', body, { endpoint: 'rtgt' });
+	}
+
+	/**
+	 * Регистрация отладчика для цели (RemoteDebuggerRunTime?cmd=register). Вызывать после attach к цели.
+	 */
+	async registerRemoteDebuggerRunTime(base: RDbgBaseRequest, targetIDStr: string, setDefDbgToThisSeance: boolean): Promise<void> {
+		const body = buildRemoteDebuggerRunTimeRegisterBody(base, targetIDStr, setDefDbgToThisSeance);
+		await this.postXml('register', body, { endpoint: 'RemoteDebuggerRunTime' });
+	}
+
+	/**
+	 * Управление вычислениями при шаге (RemoteDebuggerRunTime?cmd=evalExprStartStop). breakOnNextLine=true при шаге (F10/F11).
+	 */
+	async evalExprStartStopRemoteDebuggerRunTime(
+		base: RDbgBaseRequest,
+		targetIDStr: string,
+		envState: RemoteDebuggerEnvState,
+	): Promise<void> {
+		const body = buildEvalExprStartStopBody(base, targetIDStr, envState);
+		await this.postXml('evalExprStartStop', body, { endpoint: 'RemoteDebuggerRunTime' });
 	}
 
 	/**
@@ -725,7 +899,7 @@ export class RdbgClient {
 	}
 
 	/**
-	 * Получение стека вызовов для цели отладки (getCallStack). Формат по трафику Конфигуратора: request с debugBaseData, элемент id (не targetID).
+	 * Получение стека вызовов для цели отладки (getCallStack).
 	 */
 	async getCallStack(base: RDbgBaseRequest, targetId: DebugTargetIdLight): Promise<StackItemViewInfoData[]> {
 		const body = buildGetCallStackRequestBody(base, targetId);
@@ -735,12 +909,13 @@ export class RdbgClient {
 
 	/**
 	 * Вычисление локальных переменных (evalLocalVariables). Формат по трафику Конфигуратора (default NS debugBaseData, префиксы, два idOfDebuggerUI, calcWaitingTime 100).
-	 * При пустом теле ответа результат может прийти асинхронно в ping (exprEvaluated); выполняем до 3 опросов ping с паузой 100 ms.
+	 * При пустом ответе результат может прийти в ping (exprEvaluated). exprEvaluatedStore — из pollPing (race).
 	 */
 	async evalLocalVariables(
 		base: RDbgBaseRequest,
 		targetId: DebugTargetIdLight,
 		stackLevel: number,
+		exprEvaluatedStore?: ExprEvaluatedStore,
 	): Promise<EvalLocalVariablesResult> {
 		const { body, expressionResultID } = buildEvalLocalVariablesRequestBody(base, targetId, stackLevel);
 		const raw = await this.postXml('evalLocalVariables', body);
@@ -748,8 +923,21 @@ export class RdbgClient {
 		const xml = decoded.trim() ? decoded : raw;
 		const parsed = parseEvalLocalVariablesResult(xml);
 		if (parsed.variables.length > 0) return parsed;
-		for (let i = 0; i < 3; i++) {
-			await new Promise((r) => setTimeout(r, 100));
+		for (let i = 0; i < 7; i++) {
+			// Сначала проверяем store — exprEvaluated мог прийти в pollPing
+			if (exprEvaluatedStore) {
+				const stored = exprEvaluatedStore.take(expressionResultID);
+				if (stored) {
+					const variables = (stored.children ?? []).map((c) => ({
+						name: c.name,
+						value: c.value,
+						typeName: c.typeName,
+					}));
+					return { variables };
+				}
+			}
+			// Ждём только после первой итерации — если результат уже в ping, получим сразу
+			if (i > 0) await new Promise((r) => setTimeout(r, 80));
 			const pingResult = await this.pingDebugUIParams(base);
 			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
 			if (found) {
@@ -772,6 +960,7 @@ export class RdbgClient {
 		targetId: DebugTargetIdLight,
 		stackLevel: number,
 		expandableExpressions: string[],
+		exprEvaluatedStore?: ExprEvaluatedStore,
 	): Promise<EvalLocalVariablesBatchResult> {
 		const { body, expressionResultIDs } = buildEvalLocalVariablesBatchRequestBody(base, targetId, stackLevel, expandableExpressions);
 		const raw = await this.postXml('evalLocalVariables', body);
@@ -787,22 +976,31 @@ export class RdbgClient {
 		let variables = multi.variables;
 		const missingIds = new Set(expressionResultIDs);
 		if (variables.length > 0) missingIds.delete(expressionResultIDs[0]);
-		for (let poll = 0; poll < 3 && missingIds.size > 0; poll++) {
-			await new Promise((r) => setTimeout(r, 100));
-			const pingResult = await this.pingDebugUIParams(base);
-			for (const ev of pingResult?.exprEvaluated ?? []) {
-				if (!missingIds.has(ev.expressionResultID)) continue;
-				missingIds.delete(ev.expressionResultID);
-				const idx = expressionResultIDs.indexOf(ev.expressionResultID);
-				if (idx === 0) {
-					variables = (ev.result.children ?? []).map((c) => ({
-						name: c.name,
-						value: c.value,
-						typeName: c.typeName,
-					}));
-				} else if (idx > 0 && expandableExpressions[idx - 1] !== undefined) {
-					childrenByExpression[expandableExpressions[idx - 1]] = ev.result;
+		const consumeFromStoreOrPing = (ev: { expressionResultID: string; result: EvalExprResult }): void => {
+			if (!missingIds.has(ev.expressionResultID)) return;
+			missingIds.delete(ev.expressionResultID);
+			const idx = expressionResultIDs.indexOf(ev.expressionResultID);
+			if (idx === 0) {
+				variables = (ev.result.children ?? []).map((c) => ({
+					name: c.name,
+					value: c.value,
+					typeName: c.typeName,
+				}));
+			} else if (idx > 0 && expandableExpressions[idx - 1] !== undefined) {
+				childrenByExpression[expandableExpressions[idx - 1]] = ev.result;
+			}
+		};
+		for (let poll = 0; poll < 7 && missingIds.size > 0; poll++) {
+			if (exprEvaluatedStore) {
+				for (const id of [...missingIds]) {
+					const stored = exprEvaluatedStore.take(id);
+					if (stored) consumeFromStoreOrPing({ expressionResultID: id, result: stored });
 				}
+			}
+			if (missingIds.size === 0) break;
+			if (poll > 0) await new Promise((r) => setTimeout(r, 80));
+			for (const ev of (await this.pingDebugUIParams(base))?.exprEvaluated ?? []) {
+				consumeFromStoreOrPing(ev);
 			}
 		}
 		if (variables.length === 0) {
@@ -819,20 +1017,7 @@ export class RdbgClient {
 	 * @param command - команда с массивами attach/detach
 	 */
 	async attachDetachDbgTargets(base: RDbgBaseRequest, command: AttachDetachTargetsCommand): Promise<void> {
-		let targetsXml = '';
-		if (command.attach && command.attach.length > 0) {
-			targetsXml += `<attach xmlns="${NS.debugRDBGRequestResponse}">true</attach>`;
-			for (const id of command.attach) {
-				targetsXml += `<id xmlns="${NS.debugRDBGRequestResponse}"><id xmlns="${NS.debugBaseData}">${escapeXml(id)}</id></id>`;
-			}
-		}
-		if (command.detach && command.detach.length > 0) {
-			targetsXml += `<attach xmlns="${NS.debugRDBGRequestResponse}">false</attach>`;
-			for (const id of command.detach) {
-				targetsXml += `<id xmlns="${NS.debugRDBGRequestResponse}"><id xmlns="${NS.debugBaseData}">${escapeXml(id)}</id></id>`;
-			}
-		}
-		const body = buildRequestBody(buildBaseRequestXml(base) + targetsXml);
+		const body = buildAttachDetachDbgTargetsBody(base, command);
 		await this.postXml('attachDetachDbgTargets', body);
 	}
 
@@ -890,8 +1075,17 @@ export class RdbgClient {
 	 * @param base - базовые параметры запроса
 	 */
 	async clearBreakOnNextStatement(base: RDbgBaseRequest): Promise<void> {
-		const body = buildRequestBody(buildBaseRequestXml(base));
+		const body = buildBreakOnNextStatementBody(base);
 		await this.postXml('clearBreakOnNextStatement', body);
+	}
+
+	/**
+	 * Установка останова на следующем операторе (setBreakOnNextStatement). Как Конфигуратор 1С — перед step для F10/F11.
+	 * Не требует targetIDStr, в отличие от RemoteDebuggerRunTime?evalExprStartStop.
+	 */
+	async setBreakOnNextStatement(base: RDbgBaseRequest): Promise<void> {
+		const body = buildBreakOnNextStatementBody(base);
+		await this.postXml('setBreakOnNextStatement', body);
 	}
 }
 
@@ -904,6 +1098,50 @@ function decodeBase64ToUtf8(b64: unknown): string {
 	} catch {
 		return '';
 	}
+}
+
+/** Парсит ответ setBreakpoints: извлекает bpVersion (GUID) для RemoteDebuggerRunTime. */
+function parseSetBreakpointsResponse(xml: string): { bpVersion?: string } {
+	const result: { bpVersion?: string } = {};
+	try {
+		const parser = new XMLParser({
+			ignoreDeclaration: true,
+			removeNSPrefix: true,
+		});
+		const parsed = parser.parse(xml) as Record<string, unknown>;
+		const root = parsed.response ?? parsed.result ?? parsed.request ?? parsed;
+		const obj = (root && typeof root === 'object' ? root : parsed) as Record<string, unknown>;
+		const bpVer = obj.bpVersion ?? obj.BpVersion ?? obj.BPVersion;
+		if (bpVer != null && String(bpVer).trim() !== '') {
+			result.bpVersion = String(bpVer).trim();
+		}
+	} catch {
+		// ignore
+	}
+	return result;
+}
+
+/** Парсит ответ rtgt?cmd=pingDBGTGT: извлекает rteProcVersion. */
+function parsePingDBGTGTResponse(xml: string): PingDBGTGTResult {
+	const result: PingDBGTGTResult = {};
+	try {
+		const parser = new XMLParser({
+			ignoreDeclaration: true,
+			removeNSPrefix: true,
+		});
+		const parsed = parser.parse(xml) as Record<string, unknown>;
+		const root = parsed.response ?? parsed.request ?? parsed;
+		const obj = (root && typeof root === 'object' ? root : parsed) as Record<string, unknown>;
+		const data = obj.data ?? obj.Data;
+		const node = (data && typeof data === 'object' ? data : obj) as Record<string, unknown>;
+		const rte = node.rteProcVersion ?? node.RteProcVersion ?? node.RTEProcVersion;
+		if (rte != null && String(rte).trim() !== '') {
+			result.rteProcVersion = String(rte).trim();
+		}
+	} catch {
+		// ignore
+	}
+	return result;
 }
 
 /** Извлекает CallStackFormed из ответа pingDebugUIParams (как onec-debug-adapter DebugServerListener). */
@@ -1042,12 +1280,13 @@ function parsePingDebugUIParamsResponse(xml: string): PingDebugUIParamsResult | 
 				continue;
 			}
 
-			// Событие callStackFormed (формат из трафика: response/result xsi:type=DBGUIExtCmdInfoCallStackFormed)
+			// Событие callStackFormed (формат из трафика: response/result xsi:type=DBGUIExtCmdInfoCallStackFormed).
+			// Сервер может вернуть только cmdID/targetID/stopByBP без вложенного callStack — тогда считаем стек пустым и подгрузим через getCallStack.
 			if (!cmdId || cmdId === cmdCallStackFormed) {
 				const callStack = obj.callStack ?? obj.CallStack ?? obj.callstack ?? obj.stack;
-				if (callStack == null) continue;
-
 				const targetId = getTargetIdFromResult(obj);
+				const targetIDStrRaw = obj.targetIDStr ?? obj.TargetIDStr ?? obj.targetIdStr ?? obj.TargetIdStr;
+				const targetIDStr = typeof targetIDStrRaw === 'string' && targetIDStrRaw.trim() !== '' ? targetIDStrRaw.trim() : undefined;
 				const stopByBp = toBool(obj.stopByBp ?? obj.StopByBp ?? obj.stopByBP);
 				const suspendedByOther = toBool(obj.suspendedByOther ?? obj.SuspendedByOther);
 
@@ -1055,7 +1294,7 @@ function parsePingDebugUIParamsResponse(xml: string): PingDebugUIParamsResult | 
 				if (stopByBp) reason = 'Breakpoint';
 				else if (suspendedByOther) reason = 'Step';
 
-				const stackItems = Array.isArray(callStack) ? callStack : [callStack];
+				const stackItems = callStack != null ? (Array.isArray(callStack) ? callStack : [callStack]) : [];
 				const callStackData: StackItemViewInfoData[] = stackItems.map((si: unknown) => {
 					const s = si as Record<string, unknown>;
 					const mid = s.moduleId ?? s.ModuleId;
@@ -1085,15 +1324,18 @@ function parsePingDebugUIParamsResponse(xml: string): PingDebugUIParamsResult | 
 					};
 				});
 
+				const dataBase64Raw = resp.resultStr ?? resp.ResultStr ?? obj.resultStr ?? obj.ResultStr;
+				const dataBase64 = typeof dataBase64Raw === 'string' && dataBase64Raw.trim() !== '' ? dataBase64Raw.trim() : undefined;
 				pingResult.callStackFormed = {
 					callStack: callStackData,
 					targetId,
+					targetIDStr,
 					reason,
 					stopByBp,
 					suspendedByOther,
+					dataBase64,
 				};
 			}
-		}
 
 			// Событие exprEvaluated — результат вычисления, доставленный асинхронно в ping (evalLocalVariables/evalExpr)
 			const cmdExprEvaluated = DbguiExtCmds.ExprEvaluated.toLowerCase();
