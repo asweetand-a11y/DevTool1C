@@ -4,8 +4,59 @@
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
+import * as net from 'node:net';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+
+/** Проверяет, занят ли порт (есть ли слушающий процесс). */
+export function isPortInUse(host: string, port: number): Promise<boolean> {
+	return new Promise((resolve) => {
+		const socket = new net.Socket();
+		const timeout = setTimeout(() => {
+			socket.destroy();
+			resolve(false); // таймаут — считаем свободным
+		}, 1000);
+		socket.once('connect', () => {
+			clearTimeout(timeout);
+			socket.destroy();
+			resolve(true);
+		});
+		socket.once('error', () => {
+			clearTimeout(timeout);
+			resolve(false);
+		});
+		socket.connect(port, host);
+	});
+}
+
+/** Парсит диапазон "1560:1591" → [start, end]. */
+function parsePortRange(range: string): { start: number; end: number } | undefined {
+	if (!range?.trim()) return undefined;
+	const parts = range.split(':').map((p) => parseInt(p.trim(), 10));
+	const start = parts[0];
+	const end = parts[1] ?? start;
+	if (Number.isNaN(start) || Number.isNaN(end) || start > end) return undefined;
+	return { start, end };
+}
+
+/** Находит первый свободный порт в диапазоне. Возвращает { port, rangeForDbgs } — порт для IDE и диапазон для --portRange. */
+export async function findFirstFreePortInRange(
+	host: string,
+	portRange: string,
+): Promise<{ port: number; rangeForDbgs: string } | undefined> {
+	const parsed = parsePortRange(portRange);
+	if (!parsed) return undefined;
+	for (let p = parsed.start; p <= parsed.end; p++) {
+		const inUse = await isPortInUse(host, p);
+		if (!inUse) {
+			return {
+				port: p,
+				rangeForDbgs: `${p}:${parsed.end}`,
+			};
+		}
+	}
+	return { port: parsed.start, rangeForDbgs: portRange };
+}
 
 /**
  * Ищет каталог версии платформы (точное совпадение или префикс 8.3.27.xxxx).

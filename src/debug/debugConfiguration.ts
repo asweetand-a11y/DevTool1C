@@ -5,6 +5,7 @@
 import * as vscode from 'vscode';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { getLastDbgsLaunch } from './dbgsLaunchInfo';
 
 type EnvDefaultSection = {
 	'--ibconnection'?: string;
@@ -77,8 +78,12 @@ export class OnecDebugConfigurationProvider implements vscode.DebugConfiguration
 
 		// env.json — источник истины: подставляем значения из env, при отсутствии — из config или дефолты
 		config.debugServerHost = env['--debug-server'] ?? config.debugServerHost ?? 'localhost';
+		// Порт: если dbgs запущен расширением для этого хоста — используем выбранный при проверке диапазона
+		const dbgsLaunch = getLastDbgsLaunch();
+		const hostFromEnv = (env['--debug-server'] ?? config.debugServerHost ?? 'localhost').toLowerCase();
+		const portFromDbgs = dbgsLaunch?.debugServer?.toLowerCase() === hostFromEnv ? dbgsLaunch.port : undefined;
 		config.debugServerPort =
-			parsePortFromRange(env['--debug-port-range']) ?? config.debugServerPort ?? 1560;
+			portFromDbgs ?? parsePortFromRange(env['--debug-port-range']) ?? config.debugServerPort ?? 1560;
 		config.ibconnection = env['--ibconnection'] ?? config.ibconnection;
 		config.infoBase = env['--infoBase'] ?? config.infoBase;
 		config.infoBaseAlias = config.infoBaseAlias ?? 'DefAlias';
@@ -117,7 +122,10 @@ export class OnecDebugConfigurationProvider implements vscode.DebugConfiguration
 	): vscode.ProviderResult<vscode.DebugConfiguration[]> {
 		const workspaceFolder = _folder?.uri.fsPath ?? vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 		const env = workspaceFolder ? loadEnvDefault(workspaceFolder) : undefined;
-		const port = env?.['--debug-port-range'] ? parsePortFromRange(env['--debug-port-range']) : 1560;
+		const dbgsLaunch = getLastDbgsLaunch();
+		const hostFromEnv = (env?.['--debug-server'] ?? 'localhost').toLowerCase();
+		const portFromDbgs = dbgsLaunch?.debugServer?.toLowerCase() === hostFromEnv ? dbgsLaunch.port : undefined;
+		const port = portFromDbgs ?? (env?.['--debug-port-range'] ? parsePortFromRange(env['--debug-port-range']) : 1560);
 		const host = env?.['--debug-server'] ?? 'localhost';
 
 		return [

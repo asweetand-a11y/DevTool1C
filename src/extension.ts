@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
-import { launchDbgsProcess, resolveDbgsPath } from './debug/dbgsLauncher';
+import { findFirstFreePortInRange, launchDbgsProcess, resolveDbgsPath } from './debug/dbgsLauncher';
 import { setLastDbgsLaunch } from './debug/dbgsLaunchInfo';
 import { PlatformTreeDataProvider, PlatformTreeItem } from './treeViewProvider';
 import { VRunnerManager } from './vrunnerManager';
@@ -469,17 +469,23 @@ async function launchDbgsFromEnv(context: vscode.ExtensionContext): Promise<void
 	const notifyFilePath = path.join(os.tmpdir(), `V8_${randomUUID()}.tmp`);
 
 	try {
+		const freePortInfo = await findFirstFreePortInRange(debugServer, debugPortRange);
+		const portRangeForDbgs = freePortInfo?.rangeForDbgs ?? debugPortRange;
+		const chosenPort = freePortInfo?.port;
+
 		const ownerPid = process.pid;
 		dbgsProcess = launchDbgsProcess(dbgsPath, {
 			debugServer,
-			portRange: debugPortRange,
+			portRange: portRangeForDbgs,
 			ownerPid,
 			notifyFilePath,
 		});
 
 		const quotedPath = dbgsPath.includes(' ') ? `"${dbgsPath}"` : dbgsPath;
 		setLastDbgsLaunch({
-			commandLine: `${quotedPath} --addr=${debugServer} --portRange=${debugPortRange} --ownerPID=${ownerPid} --notify=${notifyFilePath}`,
+			commandLine: `${quotedPath} --addr=${debugServer} --portRange=${portRangeForDbgs} --ownerPID=${ownerPid} --notify=${notifyFilePath}`,
+			port: chosenPort,
+			debugServer,
 			ownerPid,
 		});
 
