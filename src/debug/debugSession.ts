@@ -11,6 +11,7 @@ import {
 	Source,
 	StackFrame,
 	StoppedEvent,
+	TerminatedEvent,
 	Thread,
 	ThreadEvent,
 } from '@vscode/debugadapter';
@@ -957,7 +958,14 @@ export class OnecDebugSession extends DebugSession {
 						hadQuit = true;
 					}
 				}
-				if (hadQuit) this.sendEvent(new InvalidatedEvent(['threads', 'stack']));
+				if (hadQuit) {
+					this.sendEvent(new InvalidatedEvent(['threads', 'stack']));
+					// Все цели завершены (1С закрыта) — сообщаем IDE о завершении сессии
+					if (this.targets.length === 0) {
+						this.stopPingPolling();
+						this.sendEvent(new TerminatedEvent());
+					}
+				}
 			}
 
 			// Событие callStackFormed — останов на брейкпойнте/шаге. StoppedEvent переводит IDE в состояние paused (F10/F11).
