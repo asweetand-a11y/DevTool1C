@@ -28,8 +28,8 @@ const DEFAULTS: DebugTimingConfig = {
 	varFetchDelayMs: 50,
 	calcWaitingTimeMs: 100,
 	pingIntervalMs: 50,
-	stepInOutDelayMs: 75,
-	immediatePingDelaysMs: [50, 100, 200],
+	stepInOutDelayMs: 40,
+	immediatePingDelaysMs: [25, 50, 100],
 	evalExprRetryDelaysMs: [50, 100],
 	variablesRequestRetryDelaysMs: [50, 100, 150],
 	pingDbgtgtIntervalMs: 5000,
@@ -70,7 +70,7 @@ export function getDebugTimingConfig(): DebugTimingConfig {
 		),
 		stepInOutDelayMs: clamp(
 			cfg.get<number>('debug.timings.stepInOutDelayMs', DEFAULTS.stepInOutDelayMs),
-			25,
+			15,
 			300,
 		),
 		immediatePingDelaysMs: asNumberArray(

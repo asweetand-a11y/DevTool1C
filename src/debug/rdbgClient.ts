@@ -181,7 +181,7 @@ function buildEvalExprRequestBody(
 		`<debugCalculations:calcItem><debugCalculations:itemType>expression</debugCalculations:itemType><debugCalculations:expression>${exprText}</debugCalculations:expression></debugCalculations:calcItem>` +
 		`<debugCalculations:interfaces>context</debugCalculations:interfaces>` +
 		`</debugCalculations:srcCalcInfo>` +
-		`<debugCalculations:presOptions><debugCalculations:maxTextSize>307200</debugCalculations:maxTextSize></debugCalculations:presOptions>` +
+		`<debugCalculations:presOptions><debugCalculations:maxTextSize>10240</debugCalculations:maxTextSize></debugCalculations:presOptions>` +
 		`</debugRDBGRequestResponse:expr>`;
 	const body = `<?xml version="1.0" encoding="UTF-8"?><request ${EVAL_LOCAL_NAMESPACES}>` +
 		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
@@ -233,7 +233,7 @@ function buildEvalLocalVariablesBatchRequestBody(
 			`<debugCalculations:calcItem><debugCalculations:itemType>expression</debugCalculations:itemType><debugCalculations:expression>${exprText}</debugCalculations:expression></debugCalculations:calcItem>` +
 			`<debugCalculations:interfaces>context</debugCalculations:interfaces>` +
 			`</debugCalculations:srcCalcInfo>` +
-			`<debugCalculations:presOptions><debugCalculations:maxTextSize>307200</debugCalculations:maxTextSize></debugCalculations:presOptions>` +
+			`<debugCalculations:presOptions><debugCalculations:maxTextSize>10240</debugCalculations:maxTextSize></debugCalculations:presOptions>` +
 			`</debugRDBGRequestResponse:expr>`,
 		);
 	}
@@ -802,12 +802,14 @@ export class RdbgClient {
 	 */
 	/**
 	 * Вычисление выражения (evalExpr). При пустом теле ответа результат может прийти в ping (exprEvaluated) либо при повторном запросе — сервер иногда возвращает пустой ответ до готовности данных.
+	 * exprEvaluatedStore — при пустом ответе проверяем store (pollPing сохраняет exprEvaluated асинхронно).
 	 */
 	async evalExpr(
 		base: RDbgBaseRequest,
 		targetId: DebugTargetIdLight,
 		expression: string,
 		frameIndex: number,
+		exprEvaluatedStore?: ExprEvaluatedStore,
 	): Promise<EvalExprResult> {
 		const { body, expressionResultID } = buildEvalExprRequestBody(base, targetId, expression, frameIndex, this.calcWaitingTimeMs);
 		let xml = await this.postXml('evalExpr', body);
@@ -815,10 +817,15 @@ export class RdbgClient {
 		let hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
 		if (hasContent) return parsed;
 
+		const fromStore = exprEvaluatedStore?.take(expressionResultID);
+		if (fromStore) return fromStore;
+
 		// При пустом ответе — retry полного запроса: серверу нужно больше времени для вычисления (calcWaitingTime 100, задержки 50, 100 ms)
 		{
 			for (const delayMs of this.evalExprRetryDelaysMs) {
 				await new Promise((r) => setTimeout(r, delayMs));
+				const beforeRetry = exprEvaluatedStore?.take(expressionResultID);
+				if (beforeRetry) return beforeRetry;
 				xml = await this.postXml('evalExpr', body);
 				parsed = parseEvalExprResult(xml);
 				hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
@@ -828,6 +835,8 @@ export class RdbgClient {
 
 		for (let i = 0; i < 4; i++) {
 			if (i > 0) await new Promise((r) => setTimeout(r, this.varFetchDelayMs));
+			const beforePing = exprEvaluatedStore?.take(expressionResultID);
+			if (beforePing) return beforePing;
 			const pingResult = await this.pingDebugUIParams(base);
 			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
 			if (found) return found.result;

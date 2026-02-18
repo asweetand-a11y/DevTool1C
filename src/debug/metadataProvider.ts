@@ -357,12 +357,10 @@ export function getModulePathByObjectProperty(
 			return info.path;
 		}
 	}
-	// Fallback: без учёта extension (на случай несовпадения имён)
-	if (ext !== '') {
-		for (const info of cache.values()) {
-			if (info.objectId === objectId && info.propertyId === propertyId) {
-				return info.path;
-			}
+	// Fallback: без учёта extension (на случай несовпадения имён или бинарный формат без extensionName)
+	for (const info of cache.values()) {
+		if (info.objectId === objectId && info.propertyId === propertyId) {
+			return info.path;
 		}
 	}
 	return '';
@@ -397,6 +395,67 @@ export function getModulePathByModuleIdStr(workspaceRoot: string, moduleIdStr: s
 		if (info.moduleIdString === alt) return info.path;
 	}
 	return '';
+}
+
+/**
+ * Проверяет, что модуль расширения использует &ИзменениеИКонтроль или &Вместо (первые 20 строк).
+ * В этом случае точки останова работают только в расширении. При &После или &Перед — работают в базе и расширении.
+ */
+export function extensionModuleUsesReplacementPrefix(bslPath: string): boolean {
+	try {
+		const content = fs.readFileSync(bslPath, 'utf8');
+		const head = content.split('\n').slice(0, 20).join('\n');
+		return /\&ИзменениеИКонтроль\s*\(|\&Вместо\s*\(/i.test(head);
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * Возвращает расширяющие ObjectModule для базового объекта. С bslPath для проверки префикса.
+ */
+export function getExtendingModules(
+	workspaceRoot: string,
+	baseObjectId: string,
+): Array<{ extension: string; objectId: string; propertyId: string; bslPath: string }> {
+	if (!workspaceRoot || !baseObjectId?.trim()) return [];
+	const result: Array<{ extension: string; objectId: string; propertyId: string; bslPath: string }> = [];
+	const baseId = baseObjectId.trim().toLowerCase();
+	for (const cfeBase of [path.join(workspaceRoot, 'src', 'cfe'), path.join(workspaceRoot, 'cfe')]) {
+		if (!fs.existsSync(cfeBase) || !fs.statSync(cfeBase).isDirectory()) continue;
+		for (const extDir of fs.readdirSync(cfeBase, { withFileTypes: true })) {
+			if (!extDir.isDirectory()) continue;
+			const extName = extDir.name;
+			const mdDirs = ['Documents', 'Catalogs', 'DataProcessors', 'Reports', 'Enums', 'CommonModules'];
+			for (const mdDirName of mdDirs) {
+				const mdPath = path.join(cfeBase, extDir.name, mdDirName);
+				if (!fs.existsSync(mdPath) || !fs.statSync(mdPath).isDirectory()) continue;
+				for (const xmlEntry of fs.readdirSync(mdPath, { withFileTypes: true })) {
+					if (!xmlEntry.name.toLowerCase().endsWith('.xml')) continue;
+					try {
+						const xmlPath = path.join(mdPath, xmlEntry.name);
+						const xml = fs.readFileSync(xmlPath, 'utf8');
+						const extObjMatch = xml.match(/ExtendedConfigurationObject>([0-9a-fA-F-]{36})</);
+						if (!extObjMatch || extObjMatch[1].toLowerCase() !== baseId) continue;
+						const uuidMatch = xml.match(/<(?:Document|Catalog|DataProcessor|Report|Enum|CommonModule)[^>]*\suuid="([0-9a-fA-F-]{36})"/);
+						if (!uuidMatch) continue;
+						const mdName = path.basename(xmlEntry.name, '.xml');
+						const bslPath = path.join(mdPath, mdName, 'Ext', 'ObjectModule.bsl');
+						result.push({
+							extension: extName,
+							objectId: uuidMatch[1],
+							propertyId: 'a637f77f-3840-441d-a1c3-699c8c5cb7e0',
+							bslPath,
+						});
+					} catch {
+						// ignore
+					}
+				}
+			}
+		}
+		break;
+	}
+	return result;
 }
 
 /**

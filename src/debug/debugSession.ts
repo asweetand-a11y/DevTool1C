@@ -22,7 +22,8 @@ import { randomUUID } from 'node:crypto';
 import { getLastDbgsLaunch } from './dbgsLaunchInfo';
 import { format1cv8cCommandLine, launch1cv8c, resolvePlatformBin } from './launch1cv8c';
 import { getVariableNamesFromProcedureAtLine } from './bslProcedureVariables';
-import { getExtensionVersionHash, getModuleInfoByPath, getModulePathByModuleIdStr, getModulePathByObjectProperty } from './metadataProvider';
+import { mapBaseBreakpointToExtensionLines } from './bslModuleStructure';
+import { getExtensionVersionHash, getExtendingModules, getModuleInfoByPath, getModulePathByModuleIdStr, getModulePathByObjectProperty } from './metadataProvider';
 import { getDebugTimingConfig } from './debugTimingConfig';
 import { RdbgClient } from './rdbgClient';
 import {
@@ -38,6 +39,9 @@ import {
 	type StackItemViewInfoData,
 } from './rdbgTypes';
 import { References } from './references';
+
+/** Получать локальные переменные с сервера RDBG. false — снимает нагрузку на сервер отладки (evalLocalVariables не вызывается). */
+const FETCH_LOCAL_VARIABLES = false;
 
 export interface OnecLaunchRequestArguments extends DebugProtocol.LaunchRequestArguments {
 	request: 'launch' | 'attach';
@@ -220,8 +224,88 @@ export class OnecDebugSession extends DebugSession {
 					}
 				}
 			}
+			await this.resendBreakpointsToServer();
 		} catch {
 			// игнорируем ошибки attach
+		}
+	}
+
+	/** Повторная отправка breakpoints в RDBG при подключении к новым целям (ServerEmulation, ManagedClient и др.). */
+	private async resendBreakpointsToServer(): Promise<void> {
+		if (!this.rdbgClient || !this.attached || this.moduleBreakpoints.size === 0) return;
+		const root = this.rootProject || '';
+		const bpWorkspace: ModuleBpInfoForRequest[] = [];
+		for (const [, stored] of this.moduleBreakpoints) {
+			const p = stored.source.path ?? '';
+			const moduleInfo = getModuleInfoByPath(root, p);
+			if (!moduleInfo.objectId || !moduleInfo.propertyId) continue;
+			const bpInfoRdbg: BreakpointInfoRdbg[] = stored.breakpoints.map((bp) => ({
+				line: bp.line,
+				isActive: true,
+				breakOnCondition: !!bp.condition,
+				condition: bp.condition ?? '',
+				breakOnHitCount: !!bp.hitCondition,
+				hitCount: typeof bp.hitCondition === 'string' && /^\d+$/.test(bp.hitCondition) ? parseInt(bp.hitCondition, 10) : 0,
+				showOutputMessage: !!bp.logMessage,
+				putExpressionResult: bp.logMessage ?? '',
+				continueExecution: !!bp.logMessage,
+			}));
+			const ext = moduleInfo.extension?.trim() ?? '';
+			const version = ext ? getExtensionVersionHash(root, ext) : undefined;
+			bpWorkspace.push({
+				extension: ext,
+				objectId: moduleInfo.objectId,
+				propertyId: moduleInfo.propertyId,
+				bslModuleType: moduleInfo.bslModuleType,
+				moduleIdString: moduleInfo.moduleIdString || undefined,
+				bpInfo: bpInfoRdbg,
+				...(version && { version }),
+			});
+			if (!ext && moduleInfo.propertyId === 'a637f77f-3840-441d-a1c3-699c8c5cb7e0') {
+				const baseBslPath = path.isAbsolute(p) ? p : path.resolve(root, p);
+				for (const extMod of getExtendingModules(root, moduleInfo.objectId)) {
+					const extVersion = getExtensionVersionHash(root, extMod.extension);
+					const extBpInfo: BreakpointInfoRdbg[] = [];
+					for (const bp of stored.breakpoints) {
+						const extLines = mapBaseBreakpointToExtensionLines(baseBslPath, bp.line, extMod.bslPath);
+						for (const L of extLines) {
+							extBpInfo.push({
+								line: L,
+								isActive: true,
+								breakOnCondition: !!bp.condition,
+								condition: bp.condition ?? '',
+								breakOnHitCount: !!bp.hitCondition,
+								hitCount: typeof bp.hitCondition === 'string' && /^\d+$/.test(bp.hitCondition) ? parseInt(bp.hitCondition, 10) : 0,
+								showOutputMessage: !!bp.logMessage,
+								putExpressionResult: bp.logMessage ?? '',
+								continueExecution: !!bp.logMessage,
+							});
+						}
+					}
+					if (extBpInfo.length > 0) {
+						bpWorkspace.push({
+							extension: extMod.extension,
+							objectId: extMod.objectId,
+							propertyId: extMod.propertyId,
+							bslModuleType: 'ObjectModule',
+							moduleIdString: undefined,
+							bpInfo: extBpInfo,
+							...(extVersion && { version: extVersion }),
+						});
+					}
+				}
+			}
+		}
+		if (bpWorkspace.length === 0) return;
+		try {
+			const res = await this.rdbgClient.setBreakpoints({
+				infoBaseAlias: this.rdbgInfoBaseAlias,
+				idOfDebuggerUi: this.debuggerId,
+				bpWorkspace,
+			});
+			if (res.bpVersion) this.lastBpVersion = res.bpVersion;
+		} catch {
+			// игнорируем
 		}
 	}
 
@@ -263,6 +347,19 @@ export class OnecDebugSession extends DebugSession {
 			}
 			if (!sourcePath && item.moduleIdStr?.trim()) {
 				sourcePath = getModulePathByModuleIdStr(root, item.moduleIdStr, extensionName);
+			}
+			if (sourcePath && propertyId === 'a637f77f-3840-441d-a1c3-699c8c5cb7e0') {
+				const presentation = (item.presentation ?? '').trim();
+				if (presentation && extensionName === '') {
+					const extMods = getExtendingModules(root, objectId);
+					for (const em of extMods) {
+						const prefix = em.extension.toLowerCase() + '_';
+						if (presentation.toLowerCase().startsWith(prefix)) {
+							sourcePath = em.bslPath;
+							break;
+						}
+					}
+				}
 			}
 			if (!sourcePath) {
 				// Fallback: активный редактор .bsl — при отладке пользователь обычно держит нужный модуль открытым
@@ -313,6 +410,7 @@ export class OnecDebugSession extends DebugSession {
 					const stackChanged = !this.isCallStackEqual(current, stack);
 					if (stackChanged) {
 						this.threadsCallStack.set(threadId, stack);
+						// Не очищаем evalExprCache — при InvalidatedEvent возвращаем кэш, пока сервер не ответит. Иначе переменные «обнуляются» при быстром F11.
 						const stoppedEv = new StoppedEvent('step', threadId);
 						(stoppedEv as { body: Record<string, unknown> }).body.preserveFocusHint = true;
 						this.sendEvent(stoppedEv);
@@ -365,6 +463,7 @@ export class OnecDebugSession extends DebugSession {
 		}
 		const stackOrdered = csf.callStack;
 		this.threadsCallStack.set(threadId, stackOrdered);
+		// Не очищаем evalExprCache на step — иначе Watch показывает «Неопределено» пока сервер не ответит на evalExpr.
 		const stoppedEv = new StoppedEvent(csf.reason, threadId);
 		(stoppedEv as { body: Record<string, unknown> }).body.preserveFocusHint = true;
 		this.sendEvent(stoppedEv);
@@ -388,6 +487,84 @@ export class OnecDebugSession extends DebugSession {
 					variablesRef: 0,
 				});
 			}).catch(() => {});
+		}
+	}
+
+	/** Фоновое вычисление выражения из Watch: после ответа сервера кэширует результат и отправляет InvalidatedEvent. При 400 (вычисления только в остановленном предмете) выполняет retry с задержками evalExprRetryDelaysMs. */
+	private async evalExprWatchAndInvalidate(
+		cacheKey: string,
+		expression: string,
+		frameIndex: number,
+		threadId: number,
+		target: DebugTargetId,
+	): Promise<void> {
+		if (!this.rdbgClient || !this.attached) return;
+		const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
+		const targetLight = { id: target.id };
+		const exprStore = {
+			take: (id: string) => {
+				const r = this.exprEvaluatedStore.get(id);
+				if (r) this.exprEvaluatedStore.delete(id);
+				return r;
+			},
+		};
+		const doEval = async (): Promise<void> => {
+			const result = await this.rdbgClient!.evalExpr(base, targetLight, expression, frameIndex, exprStore);
+			const hasMeaningful = (result.result ?? '').trim() !== '' || (result.children && result.children.length > 0);
+			if (!hasMeaningful) {
+				const cached = this.evalExprCache.get(cacheKey);
+				if (cached && ((cached.result ?? '').trim() !== '' || (cached.children?.length ?? 0) > 0)) {
+					this.sendEvent(new InvalidatedEvent(['variables']));
+					return;
+				}
+			}
+			const displayResult = result.error ?? result.result ?? result.typeName ?? 'Неопределено';
+			const hasChildren = !!(result.children && result.children.length > 0);
+			let variablesReference = 0;
+			if (hasChildren) {
+				variablesReference = this.references.registerVariable(`eval:${expression}`, {
+					type: 'evalChildren',
+					children: result.children!,
+					frameIndex,
+					threadId,
+				});
+			}
+			this.evalExprCache.set(cacheKey, {
+				result: displayResult,
+				typeName: result.typeName,
+				children: result.children,
+				variablesRef: variablesReference,
+			});
+			this.sendEvent(new InvalidatedEvent(['variables']));
+		};
+		try {
+			await doEval();
+		} catch (err) {
+			if (OnecDebugSession.isEvalOnlyWhenStoppedError(err)) {
+				for (const delayMs of this.timingConfig.evalExprRetryDelaysMs) {
+					await new Promise((r) => setTimeout(r, delayMs));
+					try {
+						await doEval();
+						return;
+					} catch (retryErr) {
+						if (!OnecDebugSession.isEvalOnlyWhenStoppedError(retryErr)) {
+							const errMsg = retryErr instanceof Error ? retryErr.message : String(retryErr);
+							this.evalExprCache.set(cacheKey, {
+								result: `Ошибка: ${errMsg}`,
+								variablesRef: 0,
+							});
+							this.sendEvent(new InvalidatedEvent(['variables']));
+							return;
+						}
+					}
+				}
+			}
+			const errMsg = err instanceof Error ? err.message : String(err);
+			this.evalExprCache.set(cacheKey, {
+				result: `Ошибка: ${errMsg}`,
+				variablesRef: 0,
+			});
+			this.sendEvent(new InvalidatedEvent(['variables']));
 		}
 	}
 
@@ -453,18 +630,18 @@ export class OnecDebugSession extends DebugSession {
 							for (const t of newTargets) {
 								const threadId = this.getThreadIdByTargetId(t.id);
 								this.sendEvent(new ThreadEvent('started', threadId));
-								this.sendEvent(new OutputEvent(
-									`[DEBUG] Цель отладки (getDbgTargets): ${getTargetTypeDisplayName(t.targetType ?? '') || 'Unknown'} (${t.userName ?? ''})\n`,
-									'console',
-								));
-							}
-							this.sendEvent(new InvalidatedEvent(['threads']));
+							this.sendEvent(new OutputEvent(
+								`[DEBUG] Цель отладки (getDbgTargets): ${getTargetTypeDisplayName(t.targetType ?? '') || 'Unknown'} (${t.userName ?? ''})\n`,
+								'console',
+							));
 						}
+						this.sendEvent(new InvalidatedEvent(['threads', 'stack']));
 					}
-				} catch {
-					// игнорируем ошибки getDbgTargets
 				}
+			} catch {
+				// игнорируем ошибки getDbgTargets
 			}
+		}
 
 			const result = await this.rdbgClient.pingDebugUIParams({
 				infoBaseAlias: this.rdbgInfoBaseAlias,
@@ -526,29 +703,32 @@ export class OnecDebugSession extends DebugSession {
 						const typeDisplay = getTargetTypeDisplayName(target.targetType ?? '') || 'Unknown';
 						const threadName = `${typeDisplay} (${target.userName ?? 'unknown'})`;
 						this.sendEvent(new ThreadEvent('started', threadId));
-						this.sendEvent(new OutputEvent(
-							`[DEBUG] Цель отладки подключена: ${threadName}\n`,
-							'console',
-						));
-					}
-					this.sendEvent(new InvalidatedEvent(['threads']));
+					this.sendEvent(new OutputEvent(
+						`[DEBUG] Цель отладки подключена: ${threadName}\n`,
+						'console',
+					));
 				}
+				this.sendEvent(new InvalidatedEvent(['threads', 'stack']));
 			}
+		}
 
 			if (result.targetQuit) {
+				let hadQuit = false;
 				for (const target of result.targetQuit) {
 					const index = this.targets.findIndex(t => t.id === target.id);
 					if (index >= 0) {
+						const threadId = index + 1;
 						this.targets.splice(index, 1);
 						this.rteProcVersionByTargetId.delete(target.id);
-						const threadId = this.getThreadIdByTargetId(target.id);
 						this.sendEvent(new ThreadEvent('exited', threadId));
 						this.sendEvent(new OutputEvent(
 							`[DEBUG] Цель отладки завершена: ${getTargetTypeDisplayName(target.targetType ?? '') || 'Unknown'}\n`,
 							'console',
 						));
+						hadQuit = true;
 					}
 				}
+				if (hadQuit) this.sendEvent(new InvalidatedEvent(['threads', 'stack']));
 			}
 
 			// Событие callStackFormed — останов на брейкпойнте/шаге. StoppedEvent переводит IDE в состояние paused (F10/F11).
@@ -989,6 +1169,41 @@ export class OnecDebugSession extends DebugSession {
 				bpInfo: bpInfoRdbg,
 				...(version && { version }),
 			});
+			// При breakpoint в базовом ObjectModule — добавить точки в расширяющие модули. Маппинг строк по структуре процедур (&ИзменениеИКонтроль, &Вместо).
+			if (!ext && moduleInfo.propertyId === 'a637f77f-3840-441d-a1c3-699c8c5cb7e0') {
+				const baseBslPath = path.isAbsolute(p) ? p : path.resolve(root, p);
+				for (const extMod of getExtendingModules(root, moduleInfo.objectId)) {
+					const extVersion = getExtensionVersionHash(root, extMod.extension);
+					const extBpInfo: BreakpointInfoRdbg[] = [];
+					for (const bp of stored.breakpoints) {
+						const extLines = mapBaseBreakpointToExtensionLines(baseBslPath, bp.line, extMod.bslPath);
+						for (const L of extLines) {
+							extBpInfo.push({
+								line: L,
+								isActive: true,
+								breakOnCondition: !!bp.condition,
+								condition: bp.condition ?? '',
+								breakOnHitCount: !!bp.hitCondition,
+								hitCount: typeof bp.hitCondition === 'string' && /^\d+$/.test(bp.hitCondition) ? parseInt(bp.hitCondition, 10) : 0,
+								showOutputMessage: !!bp.logMessage,
+								putExpressionResult: bp.logMessage ?? '',
+								continueExecution: !!bp.logMessage,
+							});
+						}
+					}
+					if (extBpInfo.length > 0) {
+						bpWorkspace.push({
+							extension: extMod.extension,
+							objectId: extMod.objectId,
+							propertyId: extMod.propertyId,
+							bslModuleType: 'ObjectModule',
+							moduleIdString: undefined,
+							bpInfo: extBpInfo,
+							...(extVersion && { version: extVersion }),
+						});
+					}
+				}
+			}
 		}
 
 		const currentModuleInfo = getModuleInfoByPath(root, sourcePath);
@@ -1060,6 +1275,17 @@ export class OnecDebugSession extends DebugSession {
 				}
 				if (!sourcePath && item.moduleIdStr?.trim()) {
 					sourcePath = getModulePathByModuleIdStr(root, item.moduleIdStr, extName);
+				}
+				if (sourcePath && item.moduleId?.propertyId === 'a637f77f-3840-441d-a1c3-699c8c5cb7e0') {
+					const pres = (item.presentation ?? '').trim();
+					if (pres && extName === '') {
+						for (const em of getExtendingModules(root, item.moduleId!.objectId)) {
+							if (pres.toLowerCase().startsWith(em.extension.toLowerCase() + '_')) {
+								sourcePath = path.isAbsolute(em.bslPath) ? em.bslPath : path.resolve(root, em.bslPath);
+								break;
+							}
+						}
+					}
 				}
 				if (sourcePath && !path.isAbsolute(sourcePath)) {
 					sourcePath = path.resolve(root, sourcePath);
@@ -1206,6 +1432,10 @@ export class OnecDebugSession extends DebugSession {
 			}
 
 			// Локальные переменные (scope «Локальные»)
+			if (!FETCH_LOCAL_VARIABLES) {
+				sendOnce({ variables: [] });
+				return;
+			}
 			if (!this.rdbgClient || !this.attached) {
 				sendOnce({ variables: [] });
 				return;
@@ -1423,6 +1653,20 @@ export class OnecDebugSession extends DebugSession {
 			}
 			const stepResponse = await this.rdbgClient.step(base, { id: target.id }, action);
 			this.mergeTargetIDStrFromResponse(stepResponse);
+			// evalExprStartStop — управление вычислениями на сервере, снижает память dbgs.exe. По умолчанию выключен — на части платформ может завершать отладку.
+			const evalExprStartStopEnabled = vscode.workspace.getConfiguration('1c-dev-tools').get<boolean>('debug.evalExprStartStopEnabled', false);
+			const targetIDStr = this.getTargetIDStr(target);
+			if (evalExprStartStopEnabled && targetIDStr) {
+				try {
+					await this.rdbgClient.evalExprStartStopRemoteDebuggerRunTime(base, targetIDStr, {
+						breakOnNextLine: action !== 'Continue',
+						bpVersion: this.lastBpVersion,
+						rteProcVersion: this.rteProcVersionByTargetId.get(target.id),
+					});
+				} catch {
+					// игнорируем ошибки evalExprStartStop
+				}
+			}
 		} catch {
 			// игнорируем ошибки шага
 		}
@@ -1485,6 +1729,17 @@ export class OnecDebugSession extends DebugSession {
 				variablesReference: cached.variablesRef,
 			};
 			this.sendResponse(response);
+			if (args.context === 'watch') {
+				void this.evalExprWatchAndInvalidate(cacheKey, args.expression, frameIndex, threadId, target);
+			}
+			return;
+		}
+
+		// Для Watch — сразу «Неопределено», затем фоновый запрос и InvalidatedEvent при ответе
+		if (args.context === 'watch') {
+			response.body = { result: 'Неопределено', variablesReference: 0 };
+			this.sendResponse(response);
+			void this.evalExprWatchAndInvalidate(cacheKey, args.expression, frameIndex, threadId, target);
 			return;
 		}
 

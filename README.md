@@ -150,11 +150,11 @@
 | varFetchDelayMs | 50 | Задержка между retry при пустом ответе |
 | calcWaitingTimeMs | 100 | calcWaitingTime в RDBG |
 | pingIntervalMs | 50 | Интервал ping |
-| stepInOutDelayMs | 75 | Задержка для Step In/Out |
-| immediatePingDelaysMs | [50, 100, 200] | Интервалы ping после F11 |
+| stepInOutDelayMs | 40 | Задержка scheduleRefreshStackAndReveal для Step In/Out (мс). Меньше — быстрее обновление после F11. |
+| immediatePingDelaysMs | [25, 50, 100] | Интервалы немедленного ping после F11/Shift+F11 для вылова callStackFormed (мс). |
 | evalExprRetryDelaysMs | [50, 100] | Задержки retry evalExpr |
-| variablesRequestRetryDelaysMs | [50, 100, 150] | Retry при пустом ответе evalLocalVariables — устраняет появление переменных «через раз» |
-| pingDbgtgtIntervalMs | 5000 | Интервал pingDBGTGT (по карте Конфигуратора ~7.5 с) |
+| variablesRequestRetryDelaysMs | [50, 100, 150] | Retry при пустом ответе evalLocalVariables|
+| pingDbgtgtIntervalMs | 5000 | Интервал pingDBGTGT
 
 **Примечание**: Локальные переменные отображаются только для **верхнего кадра** (текущей процедуры) в Call Stack. Для просмотра переменных выберите верхнюю строку в дереве вызовов.
 
