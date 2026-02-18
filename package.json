@@ -462,9 +462,25 @@
         "command": "1c-dev-tools.config.env.edit",
         "title": "Редактировать env.json",
         "category": "1C"
+      },
+      {
+        "command": "1c-dev-tools.debug.showVariableInWindow",
+        "title": "Показать значение в отдельном окне"
       }
     ],
     "menus": {
+      "debug/variables/context": [
+        {
+          "command": "1c-dev-tools.debug.showVariableInWindow",
+          "when": "debugType == 'onec'"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "1c-dev-tools.debug.showVariableInWindow",
+          "when": "debugType == 'onec' && editorTextFocus"
+        }
+      ],
       "view/title": [
         {
           "command": "1c-dev-tools.refresh",
@@ -476,8 +492,7 @@
           "when": "view == 1c-dev-tools-panel-view",
           "group": "navigation"
         }
-      ],
-      "editor/context": []
+      ]
     },
     "configuration": {
       "title": "1C Dev Tools",

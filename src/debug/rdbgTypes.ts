@@ -203,6 +203,12 @@ export interface ExprEvaluatedStore {
 	take(id: string): EvalExprResult | undefined;
 }
 
+/** Строка коллекции (ТаблицаЗначений и т.д.) — ячейки по колонкам. */
+export interface EvalExprCollectionRow {
+	index: number;
+	cells: Array<{ name: string; value: string; typeName?: string }>;
+}
+
 /** Результат вычисления выражения evalExpr. */
 export interface EvalExprResult {
 	/** Краткая строка для отображения (тип, размер коллекции или значение). */
@@ -217,6 +223,8 @@ export interface EvalExprResult {
 	collectionSize?: number;
 	/** Дочерние свойства (поля/элементы) для variablesReference. */
 	children?: EvalExprChild[];
+	/** Строки коллекции при interfaces=collection (ТаблицаЗначений, Массив и т.д.). */
+	collectionRows?: EvalExprCollectionRow[];
 }
 
 /** Локальная переменная из evalLocalVariables. */

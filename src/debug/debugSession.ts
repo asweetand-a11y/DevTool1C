@@ -168,6 +168,84 @@ export class OnecDebugSession extends DebugSession {
 		this.targets = [];
 	}
 
+	/** Кастомный запрос 1c/evaluateCollection — строки коллекции (ТаблицаЗначений и т.д.) для «Показать в отдельном окне». */
+	protected override dispatchRequest(request: DebugProtocol.Request): void {
+		if (request.command === '1c/evaluateCollection') {
+			void this.handleEvaluateCollectionRequest(request);
+			return;
+		}
+		super.dispatchRequest(request);
+	}
+
+	private async handleEvaluateCollectionRequest(request: DebugProtocol.Request): Promise<void> {
+		const req = request as unknown as { seq?: number };
+		const requestSeq = req.seq ?? 0;
+		const response: DebugProtocol.Response = {
+			type: 'response',
+			seq: requestSeq + 1,
+			request_seq: requestSeq,
+			success: true,
+			command: request.command,
+		};
+		try {
+			if (!this.rdbgClient || !this.attached) {
+				response.success = false;
+				response.message = 'Нет активной сессии отладки';
+				this.sendResponse(response);
+				return;
+			}
+			const args = (request.arguments ?? {}) as { expression?: string; frameId?: number; interfaceType?: 'collection' | 'enum' };
+			const expression = typeof args.expression === 'string' ? args.expression.trim() : '';
+			const interfaceType = args.interfaceType ?? 'collection';
+			if (!expression) {
+				response.success = false;
+				response.message = 'Не указано выражение';
+				this.sendResponse(response);
+				return;
+			}
+			const frameId = args.frameId ?? 0;
+			const threadId = frameId >= 10000 ? Math.floor(frameId / 10000) : 1;
+			const frameIndex = frameId >= 1000 ? Math.max(0, (frameId % 10000) - 1000) : 0;
+			const target = this.targets[threadId - 1] ?? this.targets[0];
+			if (!target) {
+				response.success = false;
+				response.message = 'Нет активной цели отладки';
+				this.sendResponse(response);
+				return;
+			}
+			const result =
+				interfaceType === 'enum'
+					? await this.rdbgClient.evalExprEnum(
+							{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+							{ id: target.id },
+							expression,
+							frameIndex,
+						)
+					: await this.rdbgClient.evalExprCollection(
+							{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+							{ id: target.id },
+							expression,
+							frameIndex,
+						);
+			if (result.error) {
+				response.success = false;
+				response.message = result.error;
+				this.sendResponse(response);
+				return;
+			}
+			response.body = {
+				typeName: result.typeName,
+				collectionRows: result.collectionRows,
+				collectionSize: result.collectionSize,
+				result: result.result,
+			};
+		} catch (err) {
+			response.success = false;
+			response.message = err instanceof Error ? err.message : String(err);
+		}
+		this.sendResponse(response);
+	}
+
 	private static normalizePath(p: string): string {
 		return path.resolve(p).replace(/\\/g, '/');
 	}
@@ -568,7 +646,49 @@ export class OnecDebugSession extends DebugSession {
 			},
 		};
 		const doEval = async (): Promise<void> => {
-			const result = await this.rdbgClient!.evalExpr(base, targetLight, expression, frameIndex, exprStore);
+			let result = await this.rdbgClient!.evalExpr(base, targetLight, expression, frameIndex, exprStore);
+			// Соответствие: interfaces=context даёт пустой результат — fallback на interfaces=enum
+			const isCorrespondence = /Соответствие/i.test(result.typeName ?? '');
+			if (isCorrespondence && (!result.children || result.children.length === 0)) {
+				try {
+					const enumResult = await this.rdbgClient!.evalExprEnum(base, targetLight, expression, frameIndex);
+					if (enumResult.collectionRows && enumResult.collectionRows.length > 0) {
+						result = {
+							...result,
+							children: enumResult.collectionRows.map((row) => {
+								const keyCell = row.cells.find((c) => /^Ключ$/i.test(c.name));
+								const valCell = row.cells.find((c) => /^Значение$/i.test(c.name));
+								return {
+									name: keyCell?.value ?? `[${row.index}]`,
+									value: valCell?.value ?? '',
+									typeName: valCell?.typeName,
+								};
+							}),
+						};
+					}
+				} catch {
+					// оставляем result как есть
+				}
+			}
+			// ТаблицаЗначений: interfaces=context даёт только Колонки/Индексы — fallback на interfaces=collection для строк
+			const isTable = /ТаблицаЗначений/i.test(result.typeName ?? '');
+			const onlyMetadata =
+				result.children?.length === 2 &&
+				result.children.every((c) => /^(Колонки|Индексы)$/i.test(c.name));
+			if (isTable && onlyMetadata && (result.collectionSize ?? 0) > 0) {
+				try {
+					const collResult = await this.rdbgClient!.evalExprCollection(base, targetLight, expression, frameIndex);
+					if (collResult.collectionRows && collResult.collectionRows.length > 0) {
+						const rowChildren = collResult.collectionRows.map((row) => {
+							const summary = row.cells.map((c) => `${c.name}=${c.value}`).join(', ');
+							return { name: `[${row.index}]`, value: summary, typeName: 'СтрокаТаблицыЗначений' };
+						});
+						result = { ...result, children: [...(result.children ?? []), ...rowChildren] };
+					}
+				} catch {
+					// оставляем result.children
+				}
+			}
 			const hasMeaningful = (result.result ?? '').trim() !== '' || (result.children && result.children.length > 0);
 			if (!hasMeaningful) {
 				const cached = this.evalExprCache.get(cacheKey);
@@ -588,6 +708,7 @@ export class OnecDebugSession extends DebugSession {
 			if (hasChildren) {
 				variablesReference = this.references.registerVariable(`eval:${expression}`, {
 					type: 'evalChildren',
+					expression,
 					children: result.children!,
 					frameIndex,
 					threadId,
@@ -1462,15 +1583,67 @@ export class OnecDebugSession extends DebugSession {
 					if (target) {
 						const nestedCacheKey = `${target.id}:${frameIndex}:${val.expression}`;
 						try {
-							const result = await this.rdbgClient.evalExpr(
+							let result = await this.rdbgClient.evalExpr(
 								{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
 								{ id: target.id },
 								val.expression,
 								frameIndex,
 							);
-							if (result.children && result.children.length > 0) {
+							// Соответствие: interfaces=context даёт пустой результат — fallback на interfaces=enum
+							const isCorrespondence = /Соответствие/i.test(result.typeName ?? '');
+							if (isCorrespondence && (!result.children || result.children.length === 0)) {
+								try {
+									const enumResult = await this.rdbgClient.evalExprEnum(
+										{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+										{ id: target.id },
+										val.expression,
+										frameIndex,
+									);
+									if (enumResult.collectionRows && enumResult.collectionRows.length > 0) {
+										result = {
+											...result,
+											children: enumResult.collectionRows.map((row) => {
+												const keyCell = row.cells.find((c) => /^Ключ$/i.test(c.name));
+												const valCell = row.cells.find((c) => /^Значение$/i.test(c.name));
+												return {
+													name: keyCell?.value ?? `[${row.index}]`,
+													value: valCell?.value ?? '',
+													typeName: valCell?.typeName,
+												};
+											}),
+										};
+									}
+								} catch {
+									// оставляем result как есть
+								}
+							}
+							// ТаблицаЗначений: interfaces=context даёт только Колонки/Индексы — fallback на interfaces=collection для строк
+							const isTable = /ТаблицаЗначений/i.test(result.typeName ?? '');
+							const onlyMetadata =
+								result.children?.length === 2 &&
+								result.children.every((c) => /^(Колонки|Индексы)$/i.test(c.name));
+							if (isTable && onlyMetadata && (result.collectionSize ?? 0) > 0) {
+								try {
+									const collResult = await this.rdbgClient.evalExprCollection(
+										{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+										{ id: target.id },
+										val.expression,
+										frameIndex,
+									);
+									if (collResult.collectionRows && collResult.collectionRows.length > 0) {
+										const rowChildren = collResult.collectionRows.map((row) => {
+											const summary = row.cells.map((c) => `${c.name}=${c.value}`).join(', ');
+											return { name: `[${row.index}]`, value: summary, typeName: 'СтрокаТаблицыЗначений' };
+										});
+										val.children = [...(result.children ?? []), ...rowChildren];
+									}
+								} catch {
+									// оставляем result.children (Колонки, Индексы)
+								}
+							} else if (result.children && result.children.length > 0) {
 								val.children = result.children;
-							} else {
+							}
+							if (!val.children || val.children.length === 0) {
 								const cachedNested = this.evalExprCache.get(nestedCacheKey);
 								if (cachedNested?.children && cachedNested.children.length > 0) {
 									val.children = cachedNested.children;
@@ -1495,8 +1668,8 @@ export class OnecDebugSession extends DebugSession {
 				const variables = childrenList.map((c) => {
 					const expandable = isExpandable(c.typeName);
 					let variablesReference = 0;
+					const nestedExpr = parentExpr ? (parentExpr.includes('.') ? `${parentExpr}.${c.name}` : `${parentExpr}.${c.name}`) : c.name;
 					if (expandable && parentExpr) {
-						const nestedExpr = parentExpr.includes('.') ? `${parentExpr}.${c.name}` : `${parentExpr}.${c.name}`;
 						variablesReference = this.references.registerVariable(`eval:${nestedExpr}`, {
 							type: 'evalChildren',
 							expression: nestedExpr,
@@ -1510,6 +1683,7 @@ export class OnecDebugSession extends DebugSession {
 						value: c.value,
 						type: c.typeName,
 						variablesReference,
+						evaluateName: nestedExpr,
 					};
 				});
 				sendOnce({ variables });
@@ -1618,6 +1792,7 @@ export class OnecDebugSession extends DebugSession {
 					value: v.value,
 					type: v.typeName ?? '',
 					variablesReference,
+					evaluateName: v.name,
 				};
 			});
 
@@ -1648,6 +1823,7 @@ export class OnecDebugSession extends DebugSession {
 								value: '',
 								type: '',
 								variablesReference: 0,
+								evaluateName: name,
 							}));
 						}
 				}
@@ -1833,7 +2009,7 @@ export class OnecDebugSession extends DebugSession {
 		}
 
 		try {
-			const result = await this.rdbgClient.evalExpr(
+			let result = await this.rdbgClient.evalExpr(
 				{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
 				{ id: target.id },
 				args.expression,
@@ -1843,6 +2019,32 @@ export class OnecDebugSession extends DebugSession {
 				response.body = { result: result.error, variablesReference: 0 };
 				this.sendResponse(response);
 				return;
+			}
+			// Соответствие: interfaces=context даёт пустой результат — fallback на interfaces=enum
+			const isCorrespondence = /Соответствие/i.test(result.typeName ?? '');
+			if (isCorrespondence && (!result.children || result.children.length === 0)) {
+				try {
+					const enumResult = await this.rdbgClient.evalExprEnum(
+						{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+						{ id: target.id },
+						args.expression,
+						frameIndex,
+					);
+					if (enumResult.collectionRows && enumResult.collectionRows.length > 0) {
+						const children: EvalExprResult['children'] = enumResult.collectionRows.map((row) => {
+							const keyCell = row.cells.find((c) => /^Ключ$/i.test(c.name));
+							const valCell = row.cells.find((c) => /^Значение$/i.test(c.name));
+							return {
+								name: keyCell?.value ?? `[${row.index}]`,
+								value: valCell?.value ?? '',
+								typeName: valCell?.typeName,
+							};
+						});
+						result = { ...result, children };
+					}
+				} catch {
+					// оставляем result как есть
+				}
 			}
 			const serverReturnedEmpty = !(result.result ?? '').trim() && (!result.children || result.children.length === 0);
 			if (serverReturnedEmpty) {
@@ -1860,10 +2062,13 @@ export class OnecDebugSession extends DebugSession {
 			}
 			let variablesReference = 0;
 			if (result.children && result.children.length > 0) {
+				const threadId = frameId >= 10000 ? Math.floor(frameId / 10000) : 1;
 				variablesReference = this.references.registerVariable(`eval:${args.expression}`, {
 					type: 'evalChildren',
+					expression: args.expression,
 					children: result.children,
 					frameIndex,
+					threadId,
 				});
 			}
 			this.evalExprCache.set(cacheKey, {

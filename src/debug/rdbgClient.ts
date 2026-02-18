@@ -194,6 +194,80 @@ function buildEvalExprRequestBody(
 	return { body, expressionResultID };
 }
 
+/** Вычисление коллекции (interfaces=collection, pageSize): для «Показать в отдельном окне» — строки ТаблицаЗначений, Массив. */
+function buildEvalExprCollectionRequestBody(
+	base: RDbgBaseRequest,
+	targetId: DebugTargetIdLight,
+	expression: string,
+	_frameIndex: number,
+	pageSize = 100,
+	calcWaitingTime = DEFAULT_CALC_WAITING_TIME_MS,
+): { body: string; expressionResultID: string } {
+	const alias = escapeXml(base.infoBaseAlias);
+	const dbgui = escapeXml(base.idOfDebuggerUi);
+	const id = escapeXml(targetId.id);
+	const expressionID = randomUUID();
+	const expressionResultID = randomUUID();
+	const exprText = escapeXml(expression);
+	const exprBlock =
+		`<debugRDBGRequestResponse:expr>` +
+		`<debugCalculations:srcCalcInfo>` +
+		`<debugCalculations:expressionID>${expressionID}</debugCalculations:expressionID>` +
+		`<debugCalculations:expressionResultID>${expressionResultID}</debugCalculations:expressionResultID>` +
+		`<debugCalculations:calcItem><debugCalculations:itemType>expression</debugCalculations:itemType><debugCalculations:expression>${exprText}</debugCalculations:expression></debugCalculations:calcItem>` +
+		`<debugCalculations:interfaces>collection</debugCalculations:interfaces>` +
+		`<debugCalculations:pageSize>${pageSize}</debugCalculations:pageSize>` +
+		`</debugCalculations:srcCalcInfo>` +
+		`<debugCalculations:presOptions><debugCalculations:maxTextSize>1024</debugCalculations:maxTextSize></debugCalculations:presOptions>` +
+		`</debugRDBGRequestResponse:expr>`;
+	const body = `<?xml version="1.0" encoding="UTF-8"?><request ${EVAL_LOCAL_NAMESPACES}>` +
+		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
+		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
+		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
+		`<debugRDBGRequestResponse:calcWaitingTime>${calcWaitingTime}</debugRDBGRequestResponse:calcWaitingTime>` +
+		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
+		exprBlock +
+		`</request>`;
+	return { body, expressionResultID };
+}
+
+/** Вычисление перечислимой коллекции (interfaces=enum, pageSize): Структура, Соответствие — пары Ключ/Значение. */
+function buildEvalExprEnumRequestBody(
+	base: RDbgBaseRequest,
+	targetId: DebugTargetIdLight,
+	expression: string,
+	_frameIndex: number,
+	pageSize = 100,
+	calcWaitingTime = DEFAULT_CALC_WAITING_TIME_MS,
+): { body: string; expressionResultID: string } {
+	const alias = escapeXml(base.infoBaseAlias);
+	const dbgui = escapeXml(base.idOfDebuggerUi);
+	const id = escapeXml(targetId.id);
+	const expressionID = randomUUID();
+	const expressionResultID = randomUUID();
+	const exprText = escapeXml(expression);
+	const exprBlock =
+		`<debugRDBGRequestResponse:expr>` +
+		`<debugCalculations:srcCalcInfo>` +
+		`<debugCalculations:expressionID>${expressionID}</debugCalculations:expressionID>` +
+		`<debugCalculations:expressionResultID>${expressionResultID}</debugCalculations:expressionResultID>` +
+		`<debugCalculations:calcItem><debugCalculations:itemType>expression</debugCalculations:itemType><debugCalculations:expression>${exprText}</debugCalculations:expression></debugCalculations:calcItem>` +
+		`<debugCalculations:interfaces>enum</debugCalculations:interfaces>` +
+		`<debugCalculations:pageSize>${pageSize}</debugCalculations:pageSize>` +
+		`</debugCalculations:srcCalcInfo>` +
+		`<debugCalculations:presOptions><debugCalculations:maxTextSize>1024</debugCalculations:maxTextSize></debugCalculations:presOptions>` +
+		`</debugRDBGRequestResponse:expr>`;
+	const body = `<?xml version="1.0" encoding="UTF-8"?><request ${EVAL_LOCAL_NAMESPACES}>` +
+		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
+		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
+		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
+		`<debugRDBGRequestResponse:calcWaitingTime>${calcWaitingTime}</debugRDBGRequestResponse:calcWaitingTime>` +
+		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
+		exprBlock +
+		`</request>`;
+	return { body, expressionResultID };
+}
+
 /** Батч evalLocalVariables: один запрос с несколькими expr — первый контекст (interfaces=context), остальные дочерние выражения (calcItem itemType=expression, expression=путь). */
 function buildEvalLocalVariablesBatchRequestBody(
 	base: RDbgBaseRequest,
@@ -814,7 +888,11 @@ export class RdbgClient {
 		const { body, expressionResultID } = buildEvalExprRequestBody(base, targetId, expression, frameIndex, this.calcWaitingTimeMs);
 		let xml = await this.postXml('evalExpr', body);
 		let parsed = parseEvalExprResult(xml);
-		let hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
+		let hasContent =
+			parsed.result !== '' ||
+			(parsed.children && parsed.children.length > 0) ||
+			(parsed.collectionRows && parsed.collectionRows.length > 0) ||
+			parsed.error;
 		if (hasContent) return parsed;
 
 		const fromStore = exprEvaluatedStore?.take(expressionResultID);
@@ -828,7 +906,11 @@ export class RdbgClient {
 				if (beforeRetry) return beforeRetry;
 				xml = await this.postXml('evalExpr', body);
 				parsed = parseEvalExprResult(xml);
-				hasContent = parsed.result !== '' || (parsed.children && parsed.children.length > 0) || parsed.error;
+				hasContent =
+					parsed.result !== '' ||
+					(parsed.children && parsed.children.length > 0) ||
+					(parsed.collectionRows && parsed.collectionRows.length > 0) ||
+					parsed.error;
 				if (hasContent) return parsed;
 			}
 		}
@@ -840,6 +922,91 @@ export class RdbgClient {
 			const pingResult = await this.pingDebugUIParams(base);
 			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
 			if (found) return found.result;
+		}
+		return parsed;
+	}
+
+	/**
+	 * Вычисление коллекции (interfaces=collection): строки ТаблицаЗначений, Массив и т.д. для «Показать в отдельном окне».
+	 * Результат может прийти в ping (exprEvaluated). Использует тот же retry/ping-цикл, что и evalExpr.
+	 */
+	async evalExprCollection(
+		base: RDbgBaseRequest,
+		targetId: DebugTargetIdLight,
+		expression: string,
+		frameIndex: number,
+		pageSize = 100,
+	): Promise<EvalExprResult> {
+		const { body, expressionResultID } = buildEvalExprCollectionRequestBody(
+			base,
+			targetId,
+			expression,
+			frameIndex,
+			pageSize,
+			this.calcWaitingTimeMs,
+		);
+		let xml = await this.postXml('evalExpr', body);
+		let parsed = parseEvalExprResult(xml);
+		let hasContent =
+			parsed.collectionRows && parsed.collectionRows.length > 0 ? true : parsed.result !== '' || !!parsed.error;
+		if (hasContent) return parsed;
+
+		for (const delayMs of this.evalExprRetryDelaysMs) {
+			await new Promise((r) => setTimeout(r, delayMs));
+			xml = await this.postXml('evalExpr', body);
+			parsed = parseEvalExprResult(xml);
+			hasContent = parsed.collectionRows && parsed.collectionRows.length > 0 ? true : parsed.result !== '' || !!parsed.error;
+			if (hasContent) return parsed;
+		}
+
+		for (let i = 0; i < 4; i++) {
+			if (i > 0) await new Promise((r) => setTimeout(r, this.varFetchDelayMs));
+			const pingResult = await this.pingDebugUIParams(base);
+			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
+			if (found && (found.result.collectionRows?.length ?? 0) > 0) return found.result;
+			if (found && found.result.error) return found.result;
+		}
+		return parsed;
+	}
+
+	/**
+	 * Вычисление перечислимой коллекции (interfaces=enum): Структура, Соответствие — пары Ключ/Значение. Для «Показать в отдельном окне».
+	 */
+	async evalExprEnum(
+		base: RDbgBaseRequest,
+		targetId: DebugTargetIdLight,
+		expression: string,
+		frameIndex: number,
+		pageSize = 100,
+	): Promise<EvalExprResult> {
+		const { body, expressionResultID } = buildEvalExprEnumRequestBody(
+			base,
+			targetId,
+			expression,
+			frameIndex,
+			pageSize,
+			this.calcWaitingTimeMs,
+		);
+		let xml = await this.postXml('evalExpr', body);
+		let parsed = parseEvalExprResult(xml);
+		let hasContent =
+			parsed.collectionRows && parsed.collectionRows.length > 0 ? true : parsed.result !== '' || !!parsed.error;
+		if (hasContent) return parsed;
+
+		for (const delayMs of this.evalExprRetryDelaysMs) {
+			await new Promise((r) => setTimeout(r, delayMs));
+			xml = await this.postXml('evalExpr', body);
+			parsed = parseEvalExprResult(xml);
+			hasContent = parsed.collectionRows && parsed.collectionRows.length > 0 ? true : parsed.result !== '' || !!parsed.error;
+			if (hasContent) return parsed;
+		}
+
+		for (let i = 0; i < 4; i++) {
+			if (i > 0) await new Promise((r) => setTimeout(r, this.varFetchDelayMs));
+			const pingResult = await this.pingDebugUIParams(base);
+			const found = pingResult?.exprEvaluated?.find((e) => e.expressionResultID === expressionResultID);
+			if (found && (found.result.collectionRows?.length ?? 0) > 0) return found.result;
+			if (found && found.result.error) return found.result;
 		}
 		return parsed;
 	}
@@ -1276,7 +1443,7 @@ function parsePingDebugUIParamsResponse(xml: string): PingDebugUIParamsResult | 
 			ignoreDeclaration: true,
 			removeNSPrefix: true,
 			isArray: (name) =>
-				/^(result|callstack|callStack|stack|item|stackitem)$/i.test(name),
+				/^(result|callstack|callStack|stack|item|stackitem|valueOfCollectionInfo|valueOfEnumInfo|valueOfContextPropInfo)$/i.test(name),
 		});
 		const parsed = parser.parse(xml) as Record<string, unknown>;
 		const response = parsed[ResponseSchema.rootElement] ?? parsed;
@@ -1410,6 +1577,42 @@ function parsePingDebugUIParamsResponse(xml: string): PingDebugUIParamsResult | 
 	return null;
 }
 
+/** Извлекает { name, value, typeName } из valueOfContextPropInfo / valueOfCollectionInfo. */
+function parsePropToCell(prop: Record<string, unknown>): { name: string; value: string; typeName?: string } {
+	const propInfo = (prop.propInfo ?? prop.PropInfo) as Record<string, unknown> | undefined;
+	const valInfo = (prop.valueInfo ?? prop.ValueInfo) as Record<string, unknown> | undefined;
+	const name =
+		(propInfo ? String(propInfo.propName ?? propInfo.PropName ?? '').trim() : '') ||
+		String(prop.propName ?? prop.PropName ?? '').trim();
+	const childTypeName =
+		(valInfo ? String(valInfo.typeName ?? valInfo.TypeName ?? '').trim() : String(propInfo?.typeName ?? propInfo?.TypeName ?? '').trim()) ||
+		String(prop.typeName ?? prop.TypeName ?? '').trim();
+	let value = '';
+	if (valInfo) {
+		const vd = valInfo.valueDecimal ?? valInfo.ValueDecimal;
+		const vdt = valInfo.valueDateTime ?? valInfo.ValueDateTime;
+		const vs = valInfo.valueString ?? valInfo.ValueString;
+		const vb = valInfo.valueBoolean ?? valInfo.ValueBoolean;
+		const pres = valInfo.pres ?? valInfo.Pres;
+		const typeCode = valInfo.typeCode ?? valInfo.TypeCode;
+		if (vd !== undefined && vd !== null) value = String(vd);
+		else if (vdt !== undefined && vdt !== null) value = String(vdt);
+		else if (vb !== undefined && vb !== null) value = String(vb);
+		else if (vs !== undefined && vs !== null) {
+			value = decodeBase64ToUtf8(vs) || String(vs);
+		} else if (typeof pres === 'string' && pres.length > 0) value = decodeBase64ToUtf8(pres) || pres;
+		else if (childTypeName) value = childTypeName;
+		else if (typeCode !== undefined && typeCode !== null) value = String(typeCode);
+	}
+	if (!value && childTypeName) value = childTypeName;
+	if (!value) {
+		const propPres = prop.pres ?? prop.Pres;
+		if (typeof propPres === 'string' && propPres.length > 0) value = decodeBase64ToUtf8(propPres) || propPres;
+	}
+	if (!value && name) value = 'Неопределено';
+	return { name, value: value || '', typeName: childTypeName || undefined };
+}
+
 /** Парсит один узел результата eval (resultValueInfo, calculationResult.valueOfContextPropInfo) в EvalExprResult. Используется для ответа evalExpr и для exprEvaluated в ping. */
 function parseEvalExprResultFromResultObject(res: Record<string, unknown>): EvalExprResult {
 	const errorVal = res.error ?? res.Error;
@@ -1439,43 +1642,35 @@ function parseEvalExprResultFromResultObject(res: Record<string, unknown>): Eval
 		} else if (typeof pres === 'string' && pres.length > 0) simpleValue = decodeBase64ToUtf8(pres) || pres;
 	}
 	const calcResult = (res.calculationResult ?? res.CalculationResult) as Record<string, unknown> | undefined;
+	const viewInterface = String(calcResult?.viewInterface ?? calcResult?.ViewInterface ?? 'context');
+
+	// interfaces=collection: valueOfCollectionInfo — массив строк (ТаблицаЗначений, Массив)
+	// interfaces=enum: valueOfEnumInfo — массив пар Ключ/Значение (Структура, Соответствие)
+	const collectionList = calcResult?.valueOfCollectionInfo ?? calcResult?.ValueOfCollectionInfo;
+	const enumList = calcResult?.valueOfEnumInfo ?? calcResult?.ValueOfEnumInfo;
+	const collectionArr = Array.isArray(collectionList) ? collectionList : collectionList ? [collectionList] : [];
+	const enumArr = Array.isArray(enumList) ? enumList : enumList ? [enumList] : [];
+	const rowsSource = viewInterface.toLowerCase() === 'enum' && enumArr.length > 0 ? enumArr : collectionArr;
+	if ((viewInterface.toLowerCase() === 'collection' || viewInterface.toLowerCase() === 'enum') && rowsSource.length > 0) {
+		const collectionRows: EvalExprResult['collectionRows'] = rowsSource.map((item: unknown, idx: number) => {
+			const rowObj = item as Record<string, unknown>;
+			const rowPropList = rowObj.valueOfContextPropInfo ?? rowObj.ValueOfContextPropInfo;
+			const rowArr = Array.isArray(rowPropList) ? rowPropList : rowPropList ? [rowPropList] : [];
+			const cells = rowArr.map((p: unknown) => parsePropToCell(p as Record<string, unknown>));
+			return { index: idx, cells };
+		});
+		return {
+			result: typeName + (typeof collectionSize === 'number' ? ` (${collectionSize})` : '') || typeName,
+			typeName: typeName || undefined,
+			isExpandable: true,
+			collectionSize: typeof collectionSize === 'number' ? collectionSize : collectionRows.length,
+			collectionRows,
+		};
+	}
+
 	const propList = calcResult?.valueOfContextPropInfo ?? calcResult?.ValueOfContextPropInfo;
 	const arr = Array.isArray(propList) ? propList : propList ? [propList] : [];
-	const children: EvalExprResult['children'] = arr.map((p: unknown) => {
-		const prop = p as Record<string, unknown>;
-		const propInfo = (prop.propInfo ?? prop.PropInfo) as Record<string, unknown> | undefined;
-		const valInfo = (prop.valueInfo ?? prop.ValueInfo) as Record<string, unknown> | undefined;
-		const name = (propInfo ? String(propInfo.propName ?? propInfo.PropName ?? '').trim() : '')
-			|| String(prop.propName ?? prop.PropName ?? '').trim();
-		const childTypeName = (valInfo
-			? String(valInfo.typeName ?? valInfo.TypeName ?? '').trim()
-			: String(propInfo?.typeName ?? propInfo?.TypeName ?? '').trim())
-			|| String(prop.typeName ?? prop.TypeName ?? '').trim();
-		let value = '';
-		if (valInfo) {
-			const vd = valInfo.valueDecimal ?? valInfo.ValueDecimal;
-			const vdt = valInfo.valueDateTime ?? valInfo.ValueDateTime;
-			const vs = valInfo.valueString ?? valInfo.ValueString;
-			const vb = valInfo.valueBoolean ?? valInfo.ValueBoolean;
-			const pres = valInfo.pres ?? valInfo.Pres;
-			const typeCode = valInfo.typeCode ?? valInfo.TypeCode;
-			if (vd !== undefined && vd !== null) value = String(vd);
-			else if (vdt !== undefined && vdt !== null) value = String(vdt);
-			else if (vb !== undefined && vb !== null) value = String(vb);
-			else if (vs !== undefined && vs !== null) {
-				value = decodeBase64ToUtf8(vs) || String(vs);
-			} else if (typeof pres === 'string' && pres.length > 0) value = decodeBase64ToUtf8(pres) || pres;
-			else if (childTypeName) value = childTypeName;
-			else if (typeCode !== undefined && typeCode !== null) value = String(typeCode);
-		}
-		if (!value && childTypeName) value = childTypeName;
-		if (!value) {
-			const propPres = prop.pres ?? prop.Pres;
-			if (typeof propPres === 'string' && propPres.length > 0) value = decodeBase64ToUtf8(propPres) || propPres;
-		}
-		if (!value && name) value = 'Неопределено';
-		return { name, value: value || '', typeName: childTypeName || undefined };
-	});
+	const children: EvalExprResult['children'] = arr.map((p: unknown) => parsePropToCell(p as Record<string, unknown>));
 	const summary = children.length > 0
 		? (typeName + (typeof collectionSize === 'number' ? ` (${collectionSize})` : '') + (children.length > 0 && !typeName ? ` { ${children.length} }` : '')).trim() || typeName
 		: (simpleValue || typeName);
@@ -1494,7 +1689,7 @@ function parseEvalExprResult(xml: string): EvalExprResult {
 		const parser = new XMLParser({
 			ignoreDeclaration: true,
 			removeNSPrefix: true,
-			isArray: (name) => /^valueOfContextPropInfo$/i.test(name),
+			isArray: (name) => /^(valueOfContextPropInfo|valueOfCollectionInfo|valueOfEnumInfo)$/i.test(name),
 		});
 		const parsed = parser.parse(xml) as Record<string, unknown>;
 		const response = parsed[ResponseSchema.rootElement] ?? parsed;

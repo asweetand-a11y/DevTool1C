@@ -17,6 +17,7 @@ import { RunCommands } from './commands/runCommands';
 import { TestCommands } from './commands/testCommands';
 import { WorkspaceTasksCommands } from './commands/workspaceTasksCommands';
 import { registerDebugAdapter } from './debug/debugAdapter';
+import { showVariableInWindow } from './debug/showVariableInWindow';
 
 type EnvDefaultSection = {
 	'--v8version'?: string;
@@ -359,6 +360,11 @@ export async function activate(context: vscode.ExtensionContext) {
 		infobaseCommands.createEmptyInfobase();
 	});
 
+	const showVariableInWindowCommand = vscode.commands.registerCommand(
+		'1c-dev-tools.debug.showVariableInWindow',
+		(context: unknown) => showVariableInWindow(context as Parameters<typeof showVariableInWindow>[0]),
+	);
+
 	if (panelTreeView) {
 		context.subscriptions.push(panelTreeView);
 	}
@@ -412,7 +418,8 @@ export async function activate(context: vscode.ExtensionContext) {
 		launchEditCommand,
 		fileOpenCommand,
 		launchEditConfigurationsCommand,
-		configEnvEditCommand
+		configEnvEditCommand,
+		showVariableInWindowCommand
 	);
 
 }
