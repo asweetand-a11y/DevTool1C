@@ -561,7 +561,14 @@
           "default": 50,
           "minimum": 50,
           "maximum": 1000,
-          "description": "Интервал опроса ping (rdbg pingDebugUIParams) в мс."
+          "description": "Интервал ping при выполнении (Continue). 50 — стабильность целей."
+        },
+        "1c-dev-tools.debug.timings.pingStoppedIntervalMs": {
+          "type": "number",
+          "default": 300,
+          "minimum": 100,
+          "maximum": 2000,
+          "description": "Интервал ping в режиме остановки (breakpoint/step). Меньше нагрузка на dbgs — цели и стек не меняются."
         },
         "1c-dev-tools.debug.timings.stepInOutDelayMs": {
           "type": "number",
@@ -593,7 +600,7 @@
           "default": 5000,
           "minimum": 200,
           "maximum": 60000,
-          "description": "Интервал pingDBGTGT по одной цели (мс). По карте Конфигуратора ~7.5 с. 5 с — по умолчанию."
+          "description": "Минимальный интервал между pingDBGTGT по одной цели (мс). 5000 — снижает расход памяти dbgs; без троттлинга ~40 запросов/сек."
         },
         "1c-dev-tools.debug.evalExprStartStopEnabled": {
           "type": "boolean",

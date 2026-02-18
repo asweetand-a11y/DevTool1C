@@ -147,14 +147,15 @@
 
 | Настройка | По умолчанию | Описание |
 |-----------|--------------|----------|
-| varFetchDelayMs | 50 | Задержка между retry при пустом ответе |
-| calcWaitingTimeMs | 100 | calcWaitingTime в RDBG |
-| pingIntervalMs | 50 | Интервал ping |
-| stepInOutDelayMs | 40 | Задержка scheduleRefreshStackAndReveal для Step In/Out (мс). Меньше — быстрее обновление после F11. |
-| immediatePingDelaysMs | [25, 50, 100] | Интервалы немедленного ping после F11/Shift+F11 для вылова callStackFormed (мс). |
-| evalExprRetryDelaysMs | [50, 100] | Задержки retry evalExpr |
-| variablesRequestRetryDelaysMs | [50, 100, 150] | Retry при пустом ответе evalLocalVariables|
-| pingDbgtgtIntervalMs | 5000 | Интервал pingDBGTGT
+| varFetchDelayMs | 50 | Задержка между retry при пустом ответе evalLocalVariables/evalExpr |
+| calcWaitingTimeMs | 100 | calcWaitingTime в RDBG — ожидание результата вычислений |
+| pingIntervalMs | 50 | Интервал ping при выполнении (мс). 50 — стабильность целей |
+| pingStoppedIntervalMs | 300 | Интервал ping в режиме остановки (мс). Меньше нагрузка на dbgs — цели и стек не меняются |
+| stepInOutDelayMs | 40 | Задержка scheduleRefreshStackAndReveal для Step In/Out (мс) |
+| immediatePingDelaysMs | [25, 50, 100] | Интервалы немедленного ping после F11/Shift+F11 для вылова callStackFormed (мс) |
+| evalExprRetryDelaysMs | [50, 100] | Задержки retry evalExpr при пустом ответе (мс) |
+| variablesRequestRetryDelaysMs | [50, 100, 150] | Retry при пустом ответе evalLocalVariables (мс) |
+| pingDbgtgtIntervalMs | 5000 | Минимальный интервал между pingDBGTGT по одной цели (мс). Снижает нагрузку на dbgs (rtgt) |
 
 **Примечание**: Локальные переменные отображаются только для **верхнего кадра** (текущей процедуры) в Call Stack. Для просмотра переменных выберите верхнюю строку в дереве вызовов.
 

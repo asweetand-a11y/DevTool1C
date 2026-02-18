@@ -10,8 +10,10 @@ export interface DebugTimingConfig {
 	varFetchDelayMs: number;
 	/** calcWaitingTime в RDBG — время ожидания результата вычислений (мс). */
 	calcWaitingTimeMs: number;
-	/** Интервал опроса ping (rdbg pingDebugUIParams) в мс. */
+	/** Интервал опроса ping (rdbg pingDebugUIParams) в мс — когда отладчик «идет» (Continue). */
 	pingIntervalMs: number;
+	/** Интервал ping в режиме остановки (breakpoint/step) — реже, т.к. цели и стек не меняются. */
+	pingStoppedIntervalMs: number;
 	/** Задержка scheduleRefreshStackAndReveal для Step In/Out в мс. */
 	stepInOutDelayMs: number;
 	/** Интервалы немедленного ping после F11/Shift+F11 (мс). */
@@ -28,6 +30,7 @@ const DEFAULTS: DebugTimingConfig = {
 	varFetchDelayMs: 50,
 	calcWaitingTimeMs: 100,
 	pingIntervalMs: 50,
+	pingStoppedIntervalMs: 300,
 	stepInOutDelayMs: 40,
 	immediatePingDelaysMs: [25, 50, 100],
 	evalExprRetryDelaysMs: [50, 100],
@@ -67,6 +70,11 @@ export function getDebugTimingConfig(): DebugTimingConfig {
 			cfg.get<number>('debug.timings.pingIntervalMs', DEFAULTS.pingIntervalMs),
 			50,
 			1000,
+		),
+		pingStoppedIntervalMs: clamp(
+			cfg.get<number>('debug.timings.pingStoppedIntervalMs', DEFAULTS.pingStoppedIntervalMs),
+			100,
+			2000,
 		),
 		stepInOutDelayMs: clamp(
 			cfg.get<number>('debug.timings.stepInOutDelayMs', DEFAULTS.stepInOutDelayMs),

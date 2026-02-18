@@ -133,12 +133,19 @@ export class OnecDebugSession extends DebugSession {
 	private readonly exprEvaluatedStore = new Map<string, EvalExprResult>();
 	/** rteProcVersion по targetId (из rtgt pingDBGTGT) для RemoteDebuggerRunTime. */
 	private readonly rteProcVersionByTargetId = new Map<string, string>();
+	/** Время последнего pingDBGTGT по targetId — троттлинг, чтобы не дергать rtgt каждые 50 мс (расход памяти dbgs). */
+	private readonly lastPingDbgtgtByTargetId = new Map<string, number>();
 	/** bpVersion из ответа setBreakpoints (для RemoteDebuggerRunTime). */
 	private lastBpVersion: string | undefined;
-	private pingTimer: ReturnType<typeof setInterval> | undefined;
+	private pingTimerId: ReturnType<typeof setTimeout> | undefined;
 	private pingCount = 0;
 	/** Таймеры отложенного getCallStack после Step (F10/F11/Shift+F11). */
 	private readonly pendingStackRefreshTimeouts = new Map<number, ReturnType<typeof setTimeout>>();
+	/** ID таймеров scheduleImmediatePingForCallStack — отменяем при первом callStackFormed, чтобы не дублировать обработку. */
+	private readonly immediatePingTimerIds = new Set<ReturnType<typeof setTimeout>>();
+	/** Дедупликация callStackFormed: не обрабатывать повторно, если тот же стек уже обработан недавно. */
+	private lastCallStackFormedAt = 0;
+	private lastCallStackFormedKey = '';
 	/** Дебаунс InvalidatedEvent(['variables']) при exprEvaluated — уменьшает частоту запросов переменных. */
 	private exprEvaluatedInvalidateTimer: ReturnType<typeof setTimeout> | undefined;
 	private autoAttachTypes: string[] = [];
@@ -311,13 +318,20 @@ export class OnecDebugSession extends DebugSession {
 
 	private startPingPolling(): void {
 		this.stopPingPolling();
-		this.pingTimer = setInterval(() => this.pollPing(), this.timingConfig.pingIntervalMs);
+		const scheduleNext = () => {
+			const isStopped = this.threadsCallStack.size > 0;
+			const delayMs = isStopped ? this.timingConfig.pingStoppedIntervalMs : this.timingConfig.pingIntervalMs;
+			this.pingTimerId = setTimeout(() => {
+				void this.pollPing().finally(() => scheduleNext());
+			}, delayMs);
+		};
+		scheduleNext();
 	}
 
 	private stopPingPolling(): void {
-		if (this.pingTimer) {
-			clearInterval(this.pingTimer);
-			this.pingTimer = undefined;
+		if (this.pingTimerId !== undefined) {
+			clearTimeout(this.pingTimerId);
+			this.pingTimerId = undefined;
 		}
 		if (this.exprEvaluatedInvalidateTimer) {
 			clearTimeout(this.exprEvaluatedInvalidateTimer);
@@ -426,13 +440,14 @@ export class OnecDebugSession extends DebugSession {
 	}
 
 	/** После F11/Shift+F11 — немедленные ping через 50, 100, 200 ms для вылова callStackFormed (сервер отдаёт его в ping раньше, чем getCallStack готов). */
-	private scheduleImmediatePingForCallStack(threadId: number): void {
+	private scheduleImmediatePingForCallStack(_threadId: number): void {
 		if (!this.rdbgClient || !this.attached) return;
 		const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
 		const delays = this.timingConfig.immediatePingDelaysMs;
 		for (let i = 0; i < delays.length; i++) {
 			const delayMs = delays[i];
-			setTimeout(async () => {
+			const id = setTimeout(async () => {
+				this.immediatePingTimerIds.delete(id);
 				if (!this.rdbgClient || !this.attached) return;
 				try {
 					const result = await this.rdbgClient.pingDebugUIParams(base);
@@ -441,11 +456,30 @@ export class OnecDebugSession extends DebugSession {
 					// игнорируем
 				}
 			}, delayMs);
+			this.immediatePingTimerIds.add(id);
 		}
+	}
+
+	/** Отменить отложенные immediate-ping — вызывается после успешной обработки callStackFormed. */
+	private cancelImmediatePingTimers(): void {
+		for (const id of this.immediatePingTimerIds) {
+			clearTimeout(id);
+		}
+		this.immediatePingTimerIds.clear();
 	}
 
 	/** Обработка callStackFormed: сохраняем стек, отправляем StoppedEvent, reveal. */
 	private processCallStackFormed(csf: CallStackFormedResult): void {
+		const top = csf.callStack?.[0];
+		const key = top ? `${top.presentation ?? ''}:${top.lineNo ?? 0}` : '';
+		const now = Date.now();
+		if (key && now - this.lastCallStackFormedAt < 400 && this.lastCallStackFormedKey === key) {
+			return;
+		}
+		this.lastCallStackFormedAt = now;
+		this.lastCallStackFormedKey = key;
+		this.cancelImmediatePingTimers();
+
 		let threadId = 1;
 		if (csf.targetId?.trim()) {
 			threadId = this.getThreadIdByTargetId(csf.targetId);
@@ -648,16 +682,24 @@ export class OnecDebugSession extends DebugSession {
 				idOfDebuggerUi: this.debuggerId,
 			});
 
-			// Пинг целей rtgt для обновления rteProcVersion (для RemoteDebuggerRunTime)
-			const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
-			for (const t of this.targets) {
-				const seanceId = t.seanceId ?? '';
-				if (!seanceId && !this.rteProcVersionByTargetId.has(t.id)) continue;
-				void this.rdbgClient.pingDBGTGT(base, t.id, seanceId, this.rteProcVersionByTargetId.get(t.id))
-					.then((res) => {
-						if (res.rteProcVersion) this.rteProcVersionByTargetId.set(t.id, res.rteProcVersion);
-					})
-					.catch(() => {});
+			// Пинг целей rtgt — только когда НЕ остановлены. В режиме остановки (стек есть) цели не меняются — не нагружаем dbgs.
+			const isStopped = this.threadsCallStack.size > 0;
+			if (!isStopped) {
+				const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
+				const now = Date.now();
+				const intervalMs = this.timingConfig.pingDbgtgtIntervalMs;
+				for (const t of this.targets) {
+					const seanceId = t.seanceId ?? '';
+					if (!seanceId && !this.rteProcVersionByTargetId.has(t.id)) continue;
+					const last = this.lastPingDbgtgtByTargetId.get(t.id) ?? 0;
+					if (now - last < intervalMs) continue;
+					this.lastPingDbgtgtByTargetId.set(t.id, now);
+					void this.rdbgClient.pingDBGTGT(base, t.id, seanceId, this.rteProcVersionByTargetId.get(t.id))
+						.then((res) => {
+							if (res.rteProcVersion) this.rteProcVersionByTargetId.set(t.id, res.rteProcVersion);
+						})
+						.catch(() => {});
+				}
 			}
 
 			if (!result) return;
@@ -712,14 +754,22 @@ export class OnecDebugSession extends DebugSession {
 			}
 		}
 
+			// targetQuit — при шаге (callStackFormed) не удалять цель, в которой остановились
 			if (result.targetQuit) {
+				const steppedTargetId = result.callStackFormed?.targetId?.trim()
+					|| (result.callStackFormed?.targetIDStr && this.targets.find(t => t.targetIDStr === result.callStackFormed!.targetIDStr)?.id)
+					|| '';
+				const isSteppedTargetInQuit = result.callStackFormed && this.targets.length === 1
+					&& result.targetQuit.some(t => t.id === this.targets[0]?.id);
 				let hadQuit = false;
 				for (const target of result.targetQuit) {
+					if (!target.id?.trim() || target.id === steppedTargetId || isSteppedTargetInQuit) continue;
 					const index = this.targets.findIndex(t => t.id === target.id);
 					if (index >= 0) {
 						const threadId = index + 1;
 						this.targets.splice(index, 1);
 						this.rteProcVersionByTargetId.delete(target.id);
+						this.lastPingDbgtgtByTargetId.delete(target.id);
 						this.sendEvent(new ThreadEvent('exited', threadId));
 						this.sendEvent(new OutputEvent(
 							`[DEBUG] Цель отладки завершена: ${getTargetTypeDisplayName(target.targetType ?? '') || 'Unknown'}\n`,
@@ -1061,6 +1111,7 @@ export class OnecDebugSession extends DebugSession {
 		this.clearEvalExprCache();
 		this.targets = [];
 		this.rteProcVersionByTargetId.clear();
+		this.lastPingDbgtgtByTargetId.clear();
 		// В launch-режиме всегда завершаем процесс 1cv8c (как onec-debug-adapter)
 		if (this.launchedProcess && (args.terminateDebuggee !== false)) {
 			try {
@@ -1596,6 +1647,7 @@ export class OnecDebugSession extends DebugSession {
 		args: DebugProtocol.ContinueArguments,
 		_request?: DebugProtocol.Request,
 	): Promise<void> {
+		this.threadsCallStack.clear();
 		await this.sendStepAction('Continue', args.threadId);
 		response.body = { allThreadsContinued: true };
 		this.sendResponse(response);

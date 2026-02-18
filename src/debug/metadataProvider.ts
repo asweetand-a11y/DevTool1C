@@ -336,6 +336,65 @@ export function getModuleInfoByPath(rootProject: string, sourcePath: string): Mo
 	return { extension: '', objectId: '', propertyId: '', path: sourcePath, moduleIdString: '', dbModuleType: 'Module', bslModuleType: 'ConfigModule' };
 }
 
+/** Кэш: RDBG extensionName → имя папки расширения (по Configuration.xml). */
+const rdbgExtensionToFolderCache = new Map<string, string>();
+
+/**
+ * Извлекает имя расширения из Configuration.xml (элемент Name).
+ * RDBG возвращает это имя; папка в src/cfe может отличаться.
+ */
+function getExtensionNameFromConfigurationXml(configPath: string): string {
+	try {
+		const content = fs.readFileSync(configPath, 'utf8');
+		// Имя конфигурации/расширения: <Name>, <name> или с префиксом xmlns (cfg:, v8: и т.д.)
+		const m = content.match(/<(?:[a-zA-Z0-9]+:)?[Nn]ame>([^<]+)<\/(?:[a-zA-Z0-9]+:)?[Nn]ame>/);
+		return m ? m[1].trim() : '';
+	} catch {
+		return '';
+	}
+}
+
+/**
+ * Сопоставляет extensionName из RDBG с именем папки расширения.
+ * Проверяет: 1) точное совпадение с папкой; 2) Name из Configuration.xml.
+ * @returns имя папки в src/cfe или rdbgExtensionName, если не найдено
+ */
+export function resolveRdbgExtensionNameToFolder(workspaceRoot: string, rdbgExtensionName: string): string {
+	const key = normalizePath(workspaceRoot) + '\0' + (rdbgExtensionName || '').trim();
+	const cached = rdbgExtensionToFolderCache.get(key);
+	if (cached !== undefined) return cached;
+
+	const ext = (rdbgExtensionName || '').trim();
+	if (!ext) {
+		rdbgExtensionToFolderCache.set(key, '');
+		return '';
+	}
+	const extLower = ext.toLowerCase();
+
+	for (const cfeBase of [path.join(workspaceRoot, 'src', 'cfe'), path.join(workspaceRoot, 'cfe')]) {
+		if (!fs.existsSync(cfeBase) || !fs.statSync(cfeBase).isDirectory()) continue;
+		for (const entry of fs.readdirSync(cfeBase, { withFileTypes: true })) {
+			if (!entry.isDirectory()) continue;
+			const folderName = entry.name;
+			if (folderName.toLowerCase() === extLower) {
+				rdbgExtensionToFolderCache.set(key, folderName);
+				return folderName;
+			}
+			const configPath = path.join(cfeBase, folderName, 'Configuration.xml');
+			if (!fs.existsSync(configPath)) continue;
+			const configName = getExtensionNameFromConfigurationXml(configPath);
+			if (configName && configName.toLowerCase() === extLower) {
+				rdbgExtensionToFolderCache.set(key, folderName);
+				return folderName;
+			}
+		}
+		break;
+	}
+
+	rdbgExtensionToFolderCache.set(key, ext);
+	return ext;
+}
+
 /**
  * Обратный поиск: путь к файлу .bsl по objectID и propertyID (для маппинга стека вызовов).
  * extensionName — имя расширения из RDBG (пустая строка для основной конфигурации).
@@ -352,15 +411,34 @@ export function getModulePathByObjectProperty(
 	const cache = cacheByRoot.get(root);
 	if (!cache) return '';
 	const ext = (extensionName ?? '').trim();
+	const extResolved = ext ? resolveRdbgExtensionNameToFolder(workspaceRoot, ext) : '';
 	for (const info of cache.values()) {
 		if (info.objectId === objectId && info.propertyId === propertyId && info.extension === ext) {
 			return info.path;
 		}
 	}
+	for (const info of cache.values()) {
+		if (info.objectId === objectId && info.propertyId === propertyId && info.extension === extResolved) {
+			return info.path;
+		}
+	}
 	// Fallback: без учёта extension (на случай несовпадения имён или бинарный формат без extensionName)
 	for (const info of cache.values()) {
-		if (info.objectId === objectId && info.propertyId === propertyId) {
+		if (info.objectId === objectId && info.propertyId === propertyId && !ext) {
 			return info.path;
+		}
+	}
+	// Fallback для &После/&Перед: RDBG может вернуть objectId базового объекта при выполнении в расширении.
+	// getExtendingModules ищет расширения, расширяющие baseObjectId, и возвращает bslPath модуля расширения.
+	// resolveRdbgExtensionNameToFolder сопоставляет extensionName из RDBG с именем папки (в т.ч. по Configuration.xml).
+	if (ext && propertyId === 'a637f77f-3840-441d-a1c3-699c8c5cb7e0') {
+		const folderName = resolveRdbgExtensionNameToFolder(workspaceRoot, ext);
+		const folderLower = folderName.toLowerCase();
+		const extMods = getExtendingModules(workspaceRoot, objectId);
+		for (const em of extMods) {
+			if (em.extension.toLowerCase() === folderLower) {
+				return em.bslPath;
+			}
 		}
 	}
 	return '';
@@ -379,8 +457,10 @@ export function getModulePathByModuleIdStr(workspaceRoot: string, moduleIdStr: s
 	const cache = cacheByRoot.get(root);
 	if (!cache) return '';
 	const ext = (extensionName ?? '').trim();
+	const extResolved = ext ? resolveRdbgExtensionNameToFolder(workspaceRoot, ext) : '';
 	for (const info of cache.values()) {
-		if (info.moduleIdString === normalized && info.extension === ext) return info.path;
+		if (info.moduleIdString === normalized && (info.extension === ext || info.extension === extResolved))
+			return info.path;
 	}
 	for (const info of cache.values()) {
 		if (info.moduleIdString === normalized) return info.path;
