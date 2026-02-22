@@ -37,7 +37,7 @@
     "onDebug",
     "onDebugResolve:onec"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "breakpoints": [
       {
@@ -661,10 +661,14 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./",
-    "pretest": "npm run compile && npm run lint",
+    "vscode:prepublish": "npm run check-types && node esbuild.js --production",
+    "compile": "npm run check-types && node esbuild.js",
+    "check-types": "tsc --noEmit",
+    "watch": "npm-run-all -p watch:*",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch -p .",
+    "pretest": "npm run compile && npm run compile-tests && npm run lint",
+    "compile-tests": "tsc -p . --outDir out",
     "lint": "eslint src",
     "test": "vscode-test",
     "test:rdbg": "node scripts/test-rdbg-debug.mjs",
@@ -678,6 +682,8 @@
     "iconv-lite": "^0.7.2"
   },
   "devDependencies": {
+    "esbuild": "^0.24.0",
+    "npm-run-all": "^4.1.5",
     "@types/node": "22.x",
     "@types/vscode": "^1.60.0",
     "@vscode/test-cli": "^0.0.12",
