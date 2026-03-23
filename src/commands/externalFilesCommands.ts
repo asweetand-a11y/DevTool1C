@@ -21,7 +21,8 @@ export class ExternalFilesCommands extends BaseCommand {
 
 	/**
 	 * Собирает внешний файл (обработку или отчет) из исходников
-	 * Выполняет команду v8runner-cli.os loadExternalFiles для каждой папки в исходниках
+	 * Выполняет команду v8runner-cli.os loadExternalFiles для каждой подпапки в исходниках.
+	 * В --src передаётся корневой XML рядом с подпапкой: {@code src/epf/<ИмяПодпапки>.xml} (платформа 1С ожидает файл, не каталог).
 	 * @param fileType - Тип файла: 'processor' для обработок, 'report' для отчетов
 	 * @returns Промис, который разрешается после запуска команды
 	 */
@@ -63,16 +64,25 @@ export class ExternalFilesCommands extends BaseCommand {
 			return;
 		}
 
-		// Для каждой папки создаем команду сборки
+		// Для каждой подпапки: корневой выгрузки для конфигуратора — файл <ИмяПодпапки>.xml в каталоге epf/erf
 		for (const folder of folders) {
-			const folderSrcPath = path.join(workspaceRoot, srcFolder, folder);
+			const rootXmlPath = path.join(workspaceRoot, srcFolder, `${folder}.xml`);
+			try {
+				await fs.access(rootXmlPath);
+			} catch {
+				vscode.window.showWarningMessage(
+					`Пропуск «${folder}»: не найден корневой XML «${path.join(srcFolder, `${folder}.xml`)}». Ожидается файл рядом с подпапкой исходников.`
+				);
+				continue;
+			}
+
 			const outputFileName = `${folder}.${fileType === 'processor' ? 'epf' : 'erf'}`;
 			const outputFilePath = path.join(workspaceRoot, outputFolder, outputFileName);
 
 			const args = [
 				'loadExternalFiles',
 				'--ibconnection', ibParams.connection,
-				'--src', folderSrcPath,
+				'--src', rootXmlPath,
 				'--file', outputFilePath
 			];
 
