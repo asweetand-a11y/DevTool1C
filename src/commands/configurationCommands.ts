@@ -1,6 +1,7 @@
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
+import { VRunnerManager } from '../vrunnerManager';
 import { BaseCommand } from './baseCommand';
 import {
 	getLoadConfigurationFromSrcCommandName,
@@ -76,6 +77,18 @@ export class ConfigurationCommands extends BaseCommand {
 		if (mode === 'init') {
 			args.push('--updateDB');
 		}
+
+		const logDir = this.vrunner.getDesignerLoadLogDir();
+		try {
+			await fs.mkdir(logDir, { recursive: true });
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Не удалось создать каталог логов Конфигуратора: ${(error as Error).message}`
+			);
+			return;
+		}
+		const loadLogFile = path.join(logDir, `load_${VRunnerManager.formatDesignerLoadLogTimestamp()}.log`);
+		args.push('--out', loadLogFile);
 		
 		// Выполняем oscript скрипт в терминале
 		const terminal = vscode.window.createTerminal({
@@ -293,6 +306,23 @@ export class ConfigurationCommands extends BaseCommand {
 			'--listFile', tempCommitPath,
 			'--updateDB'
 		];
+
+		const logDir = this.vrunner.getDesignerLoadLogDir();
+		try {
+			await fs.mkdir(logDir, { recursive: true });
+		} catch (error) {
+			try {
+				await fs.unlink(tempCommitPath);
+			} catch {
+				// ignore
+			}
+			vscode.window.showErrorMessage(
+				`Не удалось создать каталог логов Конфигуратора: ${(error as Error).message}`
+			);
+			return;
+		}
+		const loadLogFile = path.join(logDir, `load_${VRunnerManager.formatDesignerLoadLogTimestamp()}.log`);
+		args.push('--out', loadLogFile);
 		
 		// Формируем команду с экранированием аргументов
 		const escapedArgs = args.map(arg => {

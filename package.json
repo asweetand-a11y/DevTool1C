@@ -2,7 +2,7 @@
   "name": "1c-dev-tools",
   "displayName": "1C Dev Tools",
   "description": "Расширение для Cursor с инструментами разработки для экосистемы 1С. Предоставляет удобный интерфейс для работы с проектами 1С, включая разбор обработок, отчетов и конфигураций.",
-  "version": "2.9.8",
+  "version": "2.9.9",
   "publisher": "whiterabbit",
   "repository": {
     "type": "git",
@@ -588,6 +588,11 @@
           "type": "string",
           "default": "${workspaceFolder}\\build\\commit\\commit.txt",
           "description": "Путь к файлу Commit.txt"
+        },
+        "1c-dev-tools.paths.designerLoadLogDir": {
+          "type": "string",
+          "default": "${workspaceFolder}\\build\\logs",
+          "description": "Каталог логов загрузки Конфигуратора 1С (/Out): для cf — файл load_<дата_время>.log; для нескольких cfe подряд — load_<дата_время>_<имя_расширения>.log. Поддерживается ${workspaceFolder}."
         },
         "1c-dev-tools.ideTasks.autoCreate": {
           "type": "boolean",

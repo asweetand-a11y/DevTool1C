@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
+import { VRunnerManager } from '../vrunnerManager';
 import { BaseCommand } from './baseCommand';
 import {
 	getLoadExtensionFromSrcCommandName,
@@ -204,6 +205,17 @@ export class ExtensionsCommands extends BaseCommand {
 		const shellType = detectShellType();
 		const onescriptPath = this.vrunner.getOnescriptPath();
 
+		const logDir = this.vrunner.getDesignerLoadLogDir();
+		const logTs = VRunnerManager.formatDesignerLoadLogTimestamp();
+		try {
+			await fs.mkdir(logDir, { recursive: true });
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Не удалось создать каталог логов Конфигуратора: ${(error as Error).message}`
+			);
+			return;
+		}
+
 		// Формируем команды для всех расширений
 		const commands: string[] = [];
 
@@ -212,6 +224,12 @@ export class ExtensionsCommands extends BaseCommand {
 			const extensionSrcPath = path.isAbsolute(cfePath) 
 				? path.join(cfePath, extensionFolder)
 				: path.join(workspaceRoot, cfePath, extensionFolder);
+
+			const logFileName =
+				extensionFolders.length === 1
+					? `load_${logTs}.log`
+					: VRunnerManager.buildExtensionDesignerLoadLogFileName(logTs, extensionFolder);
+			const loadLogFile = path.join(logDir, logFileName);
 			
 			// Аргументы для универсального CLI
 			const args = [
@@ -221,7 +239,8 @@ export class ExtensionsCommands extends BaseCommand {
 				'--db-user', ibParams.username,
 				'--db-pwd', ibParams.password,
 				'--src', extensionSrcPath,
-				'--extension', extensionFolder
+				'--extension', extensionFolder,
+				'--out', loadLogFile
 			];
 
 			// Формируем команду с экранированием аргументов
@@ -635,6 +654,17 @@ export class ExtensionsCommands extends BaseCommand {
 		const shellType = detectShellType();
 		const onescriptPath = this.vrunner.getOnescriptPath();
 
+		const logDir = this.vrunner.getDesignerLoadLogDir();
+		const logTs = VRunnerManager.formatDesignerLoadLogTimestamp();
+		try {
+			await fs.mkdir(logDir, { recursive: true });
+		} catch (error) {
+			vscode.window.showErrorMessage(
+				`Не удалось создать каталог логов Конфигуратора: ${(error as Error).message}`
+			);
+			return;
+		}
+
 		// Формируем команды для всех расширений
 		const commands: string[] = [];
 		const tempFiles: string[] = [];
@@ -669,6 +699,12 @@ export class ExtensionsCommands extends BaseCommand {
 				? path.join(cfePath, extensionFolder)
 				: path.join(workspaceRoot, cfePath, extensionFolder);
 
+			const logFileName =
+				extensionFolders.length === 1
+					? `load_${logTs}.log`
+					: VRunnerManager.buildExtensionDesignerLoadLogFileName(logTs, extensionFolder);
+			const loadLogFile = path.join(logDir, logFileName);
+
 			// Формируем команду загрузки расширения через v8runner-cli.os
 			const args = [
 				scriptPath,
@@ -678,7 +714,8 @@ export class ExtensionsCommands extends BaseCommand {
 				'--db-pwd', ibParams.password,
 				'--src', extensionSrcPath,
 				'--extension', extensionFolder,
-				'--listFile', tempCommitPath
+				'--listFile', tempCommitPath,
+				'--out', loadLogFile
 			];
 
 			// Формируем команду с экранированием аргументов

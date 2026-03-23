@@ -210,6 +210,52 @@ export class VRunnerManager {
 	}
 
 	/**
+	 * Каталог логов загрузки Конфигуратора (/Out): абсолютный путь после подстановки workspace.
+	 */
+	public getDesignerLoadLogDir(): string {
+		const config = vscode.workspace.getConfiguration('1c-dev-tools');
+		let logDir = config.get<string>('paths.designerLoadLogDir', '${workspaceFolder}\\build\\logs');
+		if (logDir.includes('${workspaceFolder}')) {
+			const workspaceRoot = this.getWorkspaceRoot();
+			if (workspaceRoot) {
+				logDir = logDir.replace(/\$\{workspaceFolder\}/g, workspaceRoot);
+			}
+		}
+		const workspaceRoot = this.getWorkspaceRoot();
+		if (workspaceRoot && !path.isAbsolute(logDir)) {
+			logDir = path.join(workspaceRoot, logDir);
+		}
+		return path.normalize(logDir);
+	}
+
+	/**
+	 * Метка времени для имён файлов логов загрузки (без двоеточий, с миллисекундами).
+	 */
+	public static formatDesignerLoadLogTimestamp(): string {
+		const d = new Date();
+		const pad = (n: number, w = 2) => String(n).padStart(w, '0');
+		return (
+			`${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}_` +
+			`${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}_${pad(d.getMilliseconds(), 3)}`
+		);
+	}
+
+	/**
+	 * Имя папки расширения, безопасное для имени файла лога в Windows/Unix.
+	 */
+	public static sanitizeDesignerLoadLogExtensionSegment(extensionFolder: string): string {
+		return extensionFolder.replace(/[\\/:*?"<>|]/g, '_').trim() || 'ext';
+	}
+
+	/**
+	 * Имя файла лога для загрузки одного расширения: load_<ts>_<Ext>.log
+	 */
+	public static buildExtensionDesignerLoadLogFileName(timestamp: string, extensionFolder: string): string {
+		const safe = VRunnerManager.sanitizeDesignerLoadLogExtensionSegment(extensionFolder);
+		return `load_${timestamp}_${safe}.log`;
+	}
+
+	/**
 	 * Проверяет, установлен ли vrunner и доступен ли он для выполнения
 	 * 
 	 * Выполняет команду `vrunner version` для проверки доступности.
