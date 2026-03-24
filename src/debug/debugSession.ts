@@ -17,10 +17,13 @@ import {
 } from '@vscode/debugadapter';
 import type { DebugProtocol } from '@vscode/debugprotocol';
 import type { ChildProcess } from 'node:child_process';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
 import { getLastDbgsLaunch } from './dbgsLaunchInfo';
+import { ensureDbgsWhenDebugging } from './dbgsAutoLaunch';
+import { buildNestedEvalExpression, enrichEvalExprForCollections } from './evalExprEnrich';
 import { format1cv8cCommandLine, launch1cv8c, resolvePlatformBin } from './launch1cv8c';
 import { getVariableNamesFromProcedureAtLine } from './bslProcedureVariables';
 import { mapBaseBreakpointToExtensionLines } from './bslModuleStructure';
@@ -46,6 +49,56 @@ import {
 	getTargetTypeDisplayName,
 	matchesAutoAttachType,
 } from './debugTargetTypes';
+
+/** Паузы перед повтором rdbgTest (мс): dbgs стартует при activate расширения и может ещё не слушать порт. */
+const RDBG_TEST_RETRY_DELAYS_MS = [0, 400, 1000, 2000] as const;
+
+function isLocalDebugHost(host: string): boolean {
+	const h = host.trim().toLowerCase();
+	return h === os.hostname().toLowerCase() || h === 'localhost' || h === '127.0.0.1' || h === '::1';
+}
+
+function enrichDbgsConnectError(host: string, err: Error): Error {
+	const msg = err.message;
+	const hints: string[] = [];
+	if (!isLocalDebugHost(host)) {
+		hints.push(
+			`Хост «${host}» не совпадает с этим компьютером (${os.hostname()}) — расширение не запускает dbgs.exe для удалённого адреса; на «${host}» сервер отладки должен быть уже запущен (или используйте проброс порта).`,
+		);
+	}
+	if (/ETIMEDOUT|ECONNREFUSED|таймаут|timed out/i.test(msg)) {
+		hints.push(
+			'Проверьте сеть, firewall и что порт в launch.json совпадает с реальным портом dbgs. Если отладка стартует сразу после открытия окна Cursor, подождите 1–2 с и запустите снова — dbgs поднимается при загрузке расширения.',
+		);
+	}
+	if (hints.length === 0) {
+		return err;
+	}
+	return new Error(`${msg} ${hints.join(' ')}`);
+}
+
+async function rdbgTestWithRetry(
+	rdbgClient: RdbgClient,
+	host: string,
+	port: number,
+	log: (line: string) => void,
+): Promise<void> {
+	let lastErr: Error | undefined;
+	for (let i = 0; i < RDBG_TEST_RETRY_DELAYS_MS.length; i++) {
+		const delay = RDBG_TEST_RETRY_DELAYS_MS[i];
+		if (delay > 0) {
+			log(`Сервер отладки ${host}:${port} не ответил, повтор через ${delay} мс…\n`);
+			await new Promise((r) => setTimeout(r, delay));
+		}
+		try {
+			await rdbgClient.test();
+			return;
+		} catch (e) {
+			lastErr = e instanceof Error ? e : new Error(String(e));
+		}
+	}
+	throw enrichDbgsConnectError(host, lastErr ?? new Error('rdbgTest: нет ответа'));
+}
 
 /** Получать локальные переменные с сервера RDBG. false — снимает нагрузку на сервер отладки (evalLocalVariables не вызывается). */
 const FETCH_LOCAL_VARIABLES = false;
@@ -595,14 +648,26 @@ export class OnecDebugSession extends DebugSession {
 		for (const name of expandableNames) {
 			const cacheKey = `${targetId}:${frameIndex}:${name}`;
 			if (this.evalExprCache.has(cacheKey)) continue;
-			void this.rdbgClient.evalExpr(base, target, name, frameIndex).then((result) => {
-				this.evalExprCache.set(cacheKey, {
-					result: result.result ?? '',
-					typeName: result.typeName,
-					children: result.children,
-					variablesRef: 0,
-				});
-			}).catch(() => {});
+			void this.rdbgClient
+				.evalExpr(base, target, name, frameIndex)
+				.then(async (raw) => {
+					const result = await enrichEvalExprForCollections(
+						this.rdbgClient!,
+						base,
+						target,
+						name,
+						frameIndex,
+						raw,
+						{ isUnderManagerTempTables: /МенеджерВременныхТаблиц/i.test(name) },
+					);
+					this.evalExprCache.set(cacheKey, {
+						result: result.result ?? '',
+						typeName: result.typeName,
+						children: result.children,
+						variablesRef: 0,
+					});
+				})
+				.catch(() => {});
 		}
 	}
 
@@ -631,65 +696,15 @@ export class OnecDebugSession extends DebugSession {
 		};
 		const doEval = async (): Promise<void> => {
 			let result = await this.rdbgClient!.evalExpr(base, targetLight, expression, frameIndex, exprStore);
-			// Соответствие: interfaces=context даёт пустой результат — fallback на interfaces=enum
-			const isCorrespondence = /Соответствие/i.test(result.typeName ?? '');
-			if (isCorrespondence && (!result.children || result.children.length === 0)) {
-				try {
-					const enumResult = await this.rdbgClient!.evalExprEnum(base, targetLight, expression, frameIndex);
-					if (enumResult.collectionRows && enumResult.collectionRows.length > 0) {
-						result = {
-							...result,
-							children: enumResult.collectionRows.map((row) => {
-								const keyCell = row.cells.find((c) => /^Ключ$/i.test(c.name));
-								const valCell = row.cells.find((c) => /^Значение$/i.test(c.name));
-								return {
-									name: keyCell?.value ?? `[${row.index}]`,
-									value: valCell?.value ?? '',
-									typeName: valCell?.typeName,
-								};
-							}),
-						};
-					}
-				} catch {
-					// оставляем result как есть
-				}
-			}
-			// ТаблицаЗначений: interfaces=context даёт только Колонки/Индексы — fallback на interfaces=collection для строк
-			const isTable = /ТаблицаЗначений/i.test(result.typeName ?? '');
-			const onlyMetadata =
-				result.children?.length === 2 &&
-				result.children.every((c) => /^(Колонки|Индексы)$/i.test(c.name));
-			const atTempTableLevel = /\.Таблицы\[\d+\]\s*$/.test(expression);
-			if (isTable && onlyMetadata && (result.collectionSize ?? 0) > 0 && !atTempTableLevel) {
-				try {
-					const collResult = await this.rdbgClient!.evalExprCollection(base, targetLight, expression, frameIndex);
-					if (collResult.collectionRows && collResult.collectionRows.length > 0) {
-						const rowChildren = collResult.collectionRows.map((row) => {
-							const summary = row.cells.map((c) => `${c.name}=${c.value}`).join(', ');
-							return { name: `[${row.index}]`, value: summary, typeName: 'СтрокаТаблицыЗначений' };
-						});
-						result = { ...result, children: [...(result.children ?? []), ...rowChildren] };
-					}
-				} catch {
-					// оставляем result.children
-				}
-			}
-			// ВременныеТаблицыЗапроса (Запрос.МенеджерВременныхТаблиц.Таблицы): показывать список таблиц [0],[1],[2]
-			const isTempTables = /ВременныеТаблицыЗапроса/i.test(result.typeName ?? '');
-			if (isTempTables && (result.collectionSize ?? 0) > 0 && (!result.children || result.children.length === 0)) {
-				try {
-					const collResult = await this.rdbgClient!.evalExprCollection(base, targetLight, expression, frameIndex);
-					if (collResult.collectionRows && collResult.collectionRows.length > 0) {
-						const rowChildren = collResult.collectionRows.map((row) => {
-							const summary = row.cells.map((c) => `${c.name}=${c.value}`).join(', ');
-							return { name: `[${row.index}]`, value: summary, typeName: 'ВременнаяТаблицаЗапроса' };
-						});
-						result = { ...result, children: rowChildren };
-					}
-				} catch {
-					// оставляем result
-				}
-			}
+			result = await enrichEvalExprForCollections(
+				this.rdbgClient!,
+				base,
+				targetLight,
+				expression,
+				frameIndex,
+				result,
+				{ isUnderManagerTempTables: /МенеджерВременныхТаблиц/i.test(expression) },
+			);
 			const hasMeaningful = (result.result ?? '').trim() !== '' || (result.children && result.children.length > 0);
 			if (!hasMeaningful) {
 				const cached = this.evalExprCache.get(cacheKey);
@@ -999,20 +1014,33 @@ export class OnecDebugSession extends DebugSession {
 		args: OnecLaunchRequestArguments,
 		_launch: boolean,
 	): Promise<void> {
-		const host = args.debugServerHost ?? 'localhost';
-		const port = args.debugServerPort ?? 1560;
-		this.rootProject = (args.rootProject ?? '').trim()
-			|| vscode.workspace.workspaceFolders?.[0]?.uri.fsPath
-			|| '';
+		const workspaceRoot =
+			(args.rootProject ?? '').trim() || vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+
+		this.rootProject = workspaceRoot;
 		this.rdbgInfoBaseAlias = args.infoBaseAlias ?? 'DefAlias';
 
-		// Вывод в Debug Console: PID Cursor и команда запуска dbgs (если dbgs был запущен расширением)
+		let host = args.debugServerHost ?? 'localhost';
+		let port = args.debugServerPort ?? 1560;
+
+		const ensured = await ensureDbgsWhenDebugging(workspaceRoot || undefined, args.debugServerHost);
+		if (ensured) {
+			host = ensured.rdbgHost;
+			port = ensured.rdbgPort;
+			this.sendEvent(
+				new OutputEvent(
+					`dbgs запущен для этой сессии отладки: ${ensured.rdbgHost}:${ensured.rdbgPort}\n`,
+					'console',
+				),
+			);
+		}
+
 		this.sendEvent(new OutputEvent(`PID процесса Cursor (extension host): ${process.pid}\n`, 'console'));
 		const dbgsInfo = getLastDbgsLaunch();
 		if (dbgsInfo) {
-			this.sendEvent(new OutputEvent(`Запуск dbgs: ${dbgsInfo.commandLine}\n`, 'console'));
+			this.sendEvent(new OutputEvent(`Команда dbgs: ${dbgsInfo.commandLine}\n`, 'console'));
 		} else {
-			this.sendEvent(new OutputEvent('Запуск dbgs: (данные недоступны — dbgs мог быть запущен вне расширения)\n', 'console'));
+			this.sendEvent(new OutputEvent('dbgs: расширение не запускало процесс (удалённый сервер или нет env.json).\n', 'console'));
 		}
 
 		try {
@@ -1026,7 +1054,9 @@ export class OnecDebugSession extends DebugSession {
 					evalExprRetryDelaysMs: this.timingConfig.evalExprRetryDelaysMs,
 				},
 			});
-			await this.rdbgClient.test();
+			await rdbgTestWithRetry(this.rdbgClient, host, port, (line) => {
+				this.sendEvent(new OutputEvent(line, 'console'));
+			});
 
 			const attachResponse = await this.rdbgClient.attachDebugUI({
 				infoBaseAlias: this.rdbgInfoBaseAlias,
@@ -1601,80 +1631,15 @@ export class OnecDebugSession extends DebugSession {
 								val.expression,
 								frameIndex,
 							);
-							// Соответствие: interfaces=context даёт пустой результат — fallback на interfaces=enum
-							const isCorrespondence = /Соответствие/i.test(result.typeName ?? '');
-							if (isCorrespondence && (!result.children || result.children.length === 0)) {
-								try {
-									const enumResult = await this.rdbgClient.evalExprEnum(
-										{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-										{ id: target.id },
-										val.expression,
-										frameIndex,
-									);
-									if (enumResult.collectionRows && enumResult.collectionRows.length > 0) {
-										result = {
-											...result,
-											children: enumResult.collectionRows.map((row) => {
-												const keyCell = row.cells.find((c) => /^Ключ$/i.test(c.name));
-												const valCell = row.cells.find((c) => /^Значение$/i.test(c.name));
-												return {
-													name: keyCell?.value ?? `[${row.index}]`,
-													value: valCell?.value ?? '',
-													typeName: valCell?.typeName,
-												};
-											}),
-										};
-									}
-								} catch {
-									// оставляем result как есть
-								}
-							}
-							// МенеджерВременныхТаблиц: не вычислять элементы коллекций — зацикливание
-							const isUnderManagerTempTables = /МенеджерВременныхТаблиц/i.test(val.expression ?? '');
-							// ТаблицаЗначений: interfaces=context даёт только Колонки/Индексы — fallback на interfaces=collection для строк
-							const isTable = /ТаблицаЗначений/i.test(result.typeName ?? '');
-							const onlyMetadata =
-								result.children?.length === 2 &&
-								result.children.every((c) => /^(Колонки|Индексы)$/i.test(c.name));
-							if (isTable && onlyMetadata && (result.collectionSize ?? 0) > 0 && !isUnderManagerTempTables) {
-								try {
-									const collResult = await this.rdbgClient.evalExprCollection(
-										{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-										{ id: target.id },
-										val.expression,
-										frameIndex,
-									);
-									if (collResult.collectionRows && collResult.collectionRows.length > 0) {
-										const rowChildren = collResult.collectionRows.map((row) => {
-											const summary = row.cells.map((c) => `${c.name}=${c.value}`).join(', ');
-											return { name: `[${row.index}]`, value: summary, typeName: 'СтрокаТаблицыЗначений' };
-										});
-										val.children = [...(result.children ?? []), ...rowChildren];
-									}
-								} catch {
-									// оставляем result.children (Колонки, Индексы)
-								}
-							}
-							// ВременныеТаблицыЗапроса: показывать список таблиц [0],[1],[2]
-							const isTempTables = /ВременныеТаблицыЗапроса/i.test(result.typeName ?? '');
-							if (isTempTables && (result.collectionSize ?? 0) > 0 && (!result.children || result.children.length === 0)) {
-								try {
-									const collResult = await this.rdbgClient.evalExprCollection(
-										{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-										{ id: target.id },
-										val.expression,
-										frameIndex,
-									);
-									if (collResult.collectionRows && collResult.collectionRows.length > 0) {
-										val.children = collResult.collectionRows.map((row) => {
-											const summary = row.cells.map((c) => `${c.name}=${c.value}`).join(', ');
-											return { name: `[${row.index}]`, value: summary, typeName: 'ВременнаяТаблицаЗапроса' };
-										});
-									}
-								} catch {
-									// оставляем result
-								}
-							}
+							result = await enrichEvalExprForCollections(
+								this.rdbgClient,
+								{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+								{ id: target.id },
+								val.expression,
+								frameIndex,
+								result,
+								{ isUnderManagerTempTables: /МенеджерВременныхТаблиц/i.test(val.expression ?? '') },
+							);
 							if (!val.children || val.children.length === 0) {
 								if (result.children && result.children.length > 0) {
 									val.children = result.children;
@@ -1705,8 +1670,8 @@ export class OnecDebugSession extends DebugSession {
 				const variables = childrenList.map((c) => {
 					const expandable = isExpandable(c.typeName);
 					let variablesReference = 0;
-					const nestedExpr = parentExpr ? (parentExpr.includes('.') ? `${parentExpr}.${c.name}` : `${parentExpr}.${c.name}`) : c.name;
-					if (expandable && parentExpr) {
+					const nestedExpr = buildNestedEvalExpression(parentExpr, c.name);
+					if (expandable) {
 						variablesReference = this.references.registerVariable(`eval:${nestedExpr}`, {
 							type: 'evalChildren',
 							expression: nestedExpr,
@@ -2057,58 +2022,15 @@ export class OnecDebugSession extends DebugSession {
 				this.sendResponse(response);
 				return;
 			}
-			// Соответствие: interfaces=context даёт пустой результат — fallback на interfaces=enum
-			const isCorrespondence = /Соответствие/i.test(result.typeName ?? '');
-			if (isCorrespondence && (!result.children || result.children.length === 0)) {
-				try {
-					const enumResult = await this.rdbgClient.evalExprEnum(
-						{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-						{ id: target.id },
-						args.expression,
-						frameIndex,
-					);
-					if (enumResult.collectionRows && enumResult.collectionRows.length > 0) {
-						const children: EvalExprResult['children'] = enumResult.collectionRows.map((row) => {
-							const keyCell = row.cells.find((c) => /^Ключ$/i.test(c.name));
-							const valCell = row.cells.find((c) => /^Значение$/i.test(c.name));
-							return {
-								name: keyCell?.value ?? `[${row.index}]`,
-								value: valCell?.value ?? '',
-								typeName: valCell?.typeName,
-							};
-						});
-						result = { ...result, children };
-					}
-				} catch {
-					// оставляем result как есть
-				}
-			}
-			// ТаблицаЗначений: interfaces=context даёт только Колонки/Индексы — fallback на interfaces=collection для строк
-			const isTable = /ТаблицаЗначений/i.test(result.typeName ?? '');
-			const onlyMetadata =
-				result.children?.length === 2 &&
-				result.children.every((c) => /^(Колонки|Индексы)$/i.test(c.name));
-			// Не блокировать, если результат — ТаблицаЗначений из .ПолучитьДанные().Выгрузить() (безопасно)
-			const atTempTableLevel = /\.Таблицы\[\d+\]\s*$/.test(args.expression);
-			if (isTable && onlyMetadata && (result.collectionSize ?? 0) > 0 && !atTempTableLevel) {
-				try {
-					const collResult = await this.rdbgClient.evalExprCollection(
-						{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-						{ id: target.id },
-						args.expression,
-						frameIndex,
-					);
-					if (collResult.collectionRows && collResult.collectionRows.length > 0) {
-						const rowChildren: EvalExprResult['children'] = collResult.collectionRows.map((row) => {
-							const summary = row.cells.map((c) => `${c.name}=${c.value}`).join(', ');
-							return { name: `[${row.index}]`, value: summary, typeName: 'СтрокаТаблицыЗначений' };
-						});
-						result = { ...result, children: [...(result.children ?? []), ...rowChildren] };
-					}
-				} catch {
-					// оставляем result.children
-				}
-			}
+			result = await enrichEvalExprForCollections(
+				this.rdbgClient,
+				{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
+				{ id: target.id },
+				args.expression,
+				frameIndex,
+				result,
+				{ isUnderManagerTempTables: /МенеджерВременныхТаблиц/i.test(args.expression) },
+			);
 			const serverReturnedEmpty = !(result.result ?? '').trim() && (!result.children || result.children.length === 0);
 			if (serverReturnedEmpty) {
 				const cachedOnEmpty = this.evalExprCache.get(cacheKey);

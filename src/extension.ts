@@ -1,11 +1,7 @@
 import * as vscode from 'vscode';
-import type { ChildProcess } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
 import * as fs from 'node:fs';
-import * as os from 'node:os';
 import * as path from 'node:path';
-import { findFirstFreePortInRange, launchDbgsProcess, resolveDbgsPath } from './debug/dbgsLauncher';
-import { setLastDbgsLaunch } from './debug/dbgsLaunchInfo';
+import { killManagedDbgs } from './debug/dbgsAutoLaunch';
 import { PlatformTreeDataProvider, PlatformTreeItem } from './treeViewProvider';
 import { VRunnerManager } from './vrunnerManager';
 import { InfobaseCommands } from './commands/infobaseCommands';
@@ -19,19 +15,6 @@ import { WorkspaceTasksCommands } from './commands/workspaceTasksCommands';
 import { registerDebugAdapter } from './debug/debugAdapter';
 import { showVariableInWindow } from './debug/showVariableInWindow';
 import { openCalculateExpressionPanel } from './debug/calculateExpression';
-
-type EnvDefaultSection = {
-	'--v8version'?: string;
-	'--debug-server'?: string;
-	'--debug-port-range'?: string;
-	'--v8-platform-root'?: string;
-};
-
-type EnvConfig = {
-	default?: EnvDefaultSection;
-};
-
-let dbgsProcess: ChildProcess | undefined;
 
 /**
  * Проверяет, является ли открытая рабочая область проектом 1С
@@ -63,8 +46,6 @@ async function is1CProject(): Promise<boolean> {
  * @param context - Контекст расширения VS Code
  */
 export async function activate(context: vscode.ExtensionContext) {
-	await launchDbgsFromEnv(context);
-
 	await vscode.commands.executeCommand('setContext', '1c-dev-tools.is1CProject', false);
 
 	const isProject = await is1CProject();
@@ -436,96 +417,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
 }
 
-async function launchDbgsFromEnv(context: vscode.ExtensionContext): Promise<void> {
-	const workspaceFolder = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
-	if (!workspaceFolder) {
-		return;
-	}
-
-	const envPath = path.join(workspaceFolder, 'env.json');
-	if (!fs.existsSync(envPath)) {
-		return;
-	}
-
-	const envConfig = parseEnvConfig(envPath);
-	const envDefault = envConfig.default;
-	if (!envDefault) {
-		return;
-	}
-
-	const v8version = envDefault['--v8version'];
-	const debugServer = envDefault['--debug-server'];
-	const debugPortRange = envDefault['--debug-port-range'];
-
-	// Не запускать dbgs.exe, если сервер отладки на другом компьютере
-	const hostname = os.hostname();
-	if (debugServer && debugServer.toLocaleLowerCase() !== hostname.toLocaleLowerCase()) {
-		return;
-	}
-
-	if (!v8version || !debugServer || !debugPortRange) {
-		void vscode.window.showWarningMessage(
-			'1C Dev Tools: для запуска dbgs.exe заполните --v8version, --debug-server и --debug-port-range в env.json',
-		);
-		return;
-	}
-
-	const dbgsPath = resolveDbgsPath(v8version, envDefault['--v8-platform-root']);
-	if (!dbgsPath) {
-		void vscode.window.showErrorMessage(
-			`1C Dev Tools: не найден dbgs.exe для версии платформы ${v8version}. Укажите --v8-platform-root в env.json`,
-		);
-		return;
-	}
-
-	const notifyFilePath = path.join(os.tmpdir(), `V8_${randomUUID()}.tmp`);
-
-	try {
-		const freePortInfo = await findFirstFreePortInRange(debugServer, debugPortRange);
-		const portRangeForDbgs = freePortInfo?.rangeForDbgs ?? debugPortRange;
-		const chosenPort = freePortInfo?.port;
-
-		const ownerPid = process.pid;
-		dbgsProcess = launchDbgsProcess(dbgsPath, {
-			debugServer,
-			portRange: portRangeForDbgs,
-			ownerPid,
-			notifyFilePath,
-		});
-
-		const quotedPath = dbgsPath.includes(' ') ? `"${dbgsPath}"` : dbgsPath;
-		setLastDbgsLaunch({
-			commandLine: `${quotedPath} --addr=${debugServer} --portRange=${portRangeForDbgs} --ownerPID=${ownerPid} --notify=${notifyFilePath}`,
-			port: chosenPort,
-			debugServer,
-			ownerPid,
-		});
-
-		dbgsProcess.unref();
-		context.subscriptions.push({
-			dispose: () => {
-				if (dbgsProcess && !dbgsProcess.killed) {
-					dbgsProcess.kill();
-				}
-			},
-		});
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		void vscode.window.showErrorMessage(`1C Dev Tools: ошибка запуска dbgs.exe: ${message}`);
-	}
-}
-
-function parseEnvConfig(envPath: string): EnvConfig {
-	const rawContent = fs.readFileSync(envPath, 'utf8');
-	return JSON.parse(rawContent) as EnvConfig;
-}
-
 /**
  * Деактивирует расширение
  */
 export async function deactivate(): Promise<void> {
-	if (dbgsProcess && !dbgsProcess.killed) {
-		dbgsProcess.kill();
-	}
-	dbgsProcess = undefined;
+	killManagedDbgs();
 }
