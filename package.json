@@ -2,7 +2,7 @@
   "name": "1c-dev-tools",
   "displayName": "1C Dev Tools",
   "description": "Расширение для Cursor с инструментами разработки для экосистемы 1С. Предоставляет удобный интерфейс для работы с проектами 1С, включая разбор обработок, отчетов и конфигураций.",
-  "version": "2.9.9",
+  "version": "2.10.1",
   "publisher": "whiterabbit",
   "repository": {
     "type": "git",
@@ -35,7 +35,9 @@
   "activationEvents": [
     "workspaceContains:packagedef",
     "onDebug",
-    "onDebugResolve:onec"
+    "onDebugResolve:onec",
+    "onLanguage:bsl",
+    "onStartupFinished"
   ],
   "main": "./dist/extension.js",
   "contributes": {
@@ -110,10 +112,24 @@
                   "type": "string",
                   "enum": [
                     "Client",
-                    "Server"
+                    "ManagedClient",
+                    "WebClient",
+                    "ComConnector",
+                    "Server",
+                    "ServerEmulation",
+                    "WebService",
+                    "HttpService",
+                    "OData",
+                    "Job",
+                    "JobFileMode",
+                    "MobileClient",
+                    "MobileServer",
+                    "MobileJobFileMode",
+                    "MobileManagedClient",
+                    "MobileManagedServer"
                   ]
                 },
-                "description": "Auto-attach target types"
+                "description": "Типы целей автоподключения"
               }
             }
           },
@@ -152,8 +168,27 @@
               "autoAttachTypes": {
                 "type": "array",
                 "items": {
-                  "type": "string"
-                }
+                  "type": "string",
+                  "enum": [
+                    "Client",
+                    "ManagedClient",
+                    "WebClient",
+                    "ComConnector",
+                    "Server",
+                    "ServerEmulation",
+                    "WebService",
+                    "HttpService",
+                    "OData",
+                    "Job",
+                    "JobFileMode",
+                    "MobileClient",
+                    "MobileServer",
+                    "MobileJobFileMode",
+                    "MobileManagedClient",
+                    "MobileManagedServer"
+                  ]
+                },
+                "description": "Типы целей автоподключения"
               }
             }
           }

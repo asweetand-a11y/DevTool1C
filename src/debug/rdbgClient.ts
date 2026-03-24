@@ -41,6 +41,7 @@ import type {
 import * as iconv from 'iconv-lite';
 import { XMLParser } from 'fast-xml-parser';
 import { NS, ResponseSchema, DbguiExtCmds } from './xdtoSchema';
+import { toSetAutoAttachTargetTypeXmlValue } from './debugTargetTypes';
 
 /** Кодировка запросов к серверу отладки 1С: при true — Windows-1251 (кириллица в evalExpr), иначе UTF-8. Ответы всегда декодируем как UTF-8 (имена/значения переменных в панели VARIABLES приходят в UTF-8). */
 const RDBG_REQUEST_WINDOWS_1251 = true;
@@ -1245,17 +1246,18 @@ export class RdbgClient {
 	 * @param settings - настройки автоподключения по типам
 	 */
 	async setAutoAttachSettings(base: RDbgBaseRequest, settings: AutoAttachSettings): Promise<void> {
-		// Правильная структура из C# примера:
-		// <autoAttachSettings xmlns="debugRDBGRequestResponse">
-		//   <targetType xmlns="debugAutoAttach">Client</targetType>
-		// </autoAttachSettings>
+		// autoAttachSettings — дочерний элемент request в NS debugRDBGRequestResponse (RDBGSetAutoAttachSettingsRequest).
+		// Текст targetType — XmlEnum из DebugTargetType (WEBClient, JOB, COMConnector, …), см. Messages.cs.
 		const targetTypesXml = settings.targetTypes
-			.filter((t) => t.autoAttach) // Только включенные типы
-			.map((t) => `<targetType xmlns="${NS.debugAutoAttach}">${escapeXml(t.type)}</targetType>`)
+			.filter((t) => t.autoAttach)
+			.map(
+				(t) =>
+					`<targetType xmlns="${NS.debugAutoAttach}">${escapeXml(toSetAutoAttachTargetTypeXmlValue(t.type))}</targetType>`,
+			)
 			.join('');
 		const body = buildRequestBody(
-			buildBaseRequestXml(base) + 
-			`<autoAttachSettings xmlns="${NS.debugRDBGRequestResponse}">${targetTypesXml}</autoAttachSettings>`,
+			buildBaseRequestXml(base) +
+				`<autoAttachSettings xmlns="${NS.debugRDBGRequestResponse}">${targetTypesXml}</autoAttachSettings>`,
 		);
 		await this.postXml('setAutoAttachSettings', body);
 	}

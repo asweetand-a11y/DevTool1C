@@ -40,6 +40,12 @@ import {
 	type StackItemViewInfoData,
 } from './rdbgTypes';
 import { References } from './references';
+import {
+	expandAutoAttachTypesForRdbg,
+	findUnknownAutoAttachTypes,
+	getTargetTypeDisplayName,
+	matchesAutoAttachType,
+} from './debugTargetTypes';
 
 /** Получать локальные переменные с сервера RDBG. false — снимает нагрузку на сервер отладки (evalLocalVariables не вызывается). */
 const FETCH_LOCAL_VARIABLES = false;
@@ -67,35 +73,6 @@ export interface OnecLaunchRequestArguments extends DebugProtocol.LaunchRequestA
 interface StoredBreakpoints {
 	source: DebugProtocol.Source;
 	breakpoints: DebugProtocol.SourceBreakpoint[];
-}
-
-/** Отображаемое имя типа цели в Call Stack (перевод на русский). */
-const TARGET_TYPE_LABELS: Record<string, string> = {
-	ServerEmulation: 'Сервер (файловый режим)',
-	ManagedClient: 'Клиент (менеджер)',
-	Client: 'Клиент',
-	WebClient: 'Веб-клиент',
-	MobileClient: 'Мобильный клиент',
-	Server: 'Сервер',
-	MobileServer: 'Мобильный сервер',
-};
-
-function getTargetTypeDisplayName(targetType: string): string {
-	const t = (targetType ?? '').trim();
-	const label = TARGET_TYPE_LABELS[t];
-	return label !== undefined ? label : t;
-}
-
-/** Client→Client,ManagedClient,WebClient; Server→Server,ServerEmulation. */
-function matchesAutoAttachType(targetType: string, autoAttachTypes: string[]): boolean {
-	const t = targetType.trim();
-	for (const a of autoAttachTypes) {
-		const type = a.trim();
-		if (type === t) return true;
-		if (type === 'Client' && /^(Client|ManagedClient|WebClient|MobileClient)$/i.test(t)) return true;
-		if (type === 'Server' && /^(Server|ServerEmulation|MobileServer)$/i.test(t)) return true;
-	}
-	return false;
 }
 
 /** Строка пригодна для отображения как имя источника (модуль/процедура). Отсекает бинарные/некорректные значения, из-за которых IDE показывает "Could not load source '@мусор'". */
@@ -1084,16 +1061,20 @@ export class OnecDebugSession extends DebugSession {
 				this.autoAttachTypes = Array.isArray(autoAttachTypes) ? autoAttachTypes : [];
 				if (autoAttachTypes && this.autoAttachTypes.length > 0) {
 					try {
-						const targetTypes = autoAttachTypes.map(type => ({
-							type,
-							autoAttach: true,
-						}));
+						const unknownTypes = findUnknownAutoAttachTypes(autoAttachTypes);
+						if (unknownTypes.length > 0) {
+							this.sendEvent(new OutputEvent(
+								`[WARNING] Неизвестные autoAttachTypes (нет в справочнике платформы): ${unknownTypes.join(', ')}\n`,
+								'stderr',
+							));
+						}
+						const targetTypes = expandAutoAttachTypesForRdbg(autoAttachTypes);
 						await this.rdbgClient.setAutoAttachSettings(
 							{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
 							{ targetTypes },
 						);
 						this.sendEvent(new OutputEvent(
-							`[DEBUG] Auto-attach настроен для типов: ${autoAttachTypes.join(', ')}\n`,
+							`[DEBUG] Auto-attach: конфиг ${autoAttachTypes.join(', ')}; в RDBG: ${targetTypes.map((x) => x.type).join(', ')}\n`,
 							'console',
 						));
 					} catch (err) {

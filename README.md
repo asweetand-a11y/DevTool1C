@@ -134,12 +134,16 @@
 		"infoBaseAlias": "DefAlias",
 		"autoAttachTypes": [
 			"Client",
-			"Server"
+			"Server",
+			"Job",
+			"JobFileMode"
 		]
 	}
 	]
 }
 ```
+
+**`autoAttachTypes`** — типы целей RDBG для автоподключения. Допустимые значения: `Client`, `ManagedClient`, `WebClient`, `ComConnector`, `Server`, `ServerEmulation`, `WebService`, `HttpService`, `OData`, `Job`, `JobFileMode`, `MobileClient`, `MobileServer`, `MobileJobFileMode`, `MobileManagedClient`, `MobileManagedServer`. Пресеты **`Client`** и **`Server`** при отправке в сервер отладки разворачиваются в набор подтипов (клиент: обычный, менеджер, веб, мобильный; сервер: сервер, файловый режим, мобильный сервер). Остальные типы передаются в RDBG как указано. Неизвестные строки в конфигурации подсвечиваются предупреждением в консоли отладки, но всё равно отправляются в `setAutoAttachSettings`.
 
 В настройках расширения можно управлять таймингами обмена с сервером отладки
 
