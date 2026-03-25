@@ -125,18 +125,30 @@
 ```json
 {
 	"configurations": [
+		{
+			"type": "onec",
+			"request": "attach",
+			"name": "1C: Запуск с фоновыми заданиями",
+			"debugServerHost": "localhost",
+			"debugServerPort": 1560,
+			"infoBaseAlias": "DefAlias",
+			"autoAttachTypes": [
+				"Client",
+				"Server",
+				"Job",
+				"JobFileMode"
+			]
+		},
 	{
 		"type": "onec",
 		"request": "launch",
-		"name": "1C: Запуск",
+		"name": "1C: Запуск без фоновых заданий",
 		"debugServerHost": "localhost",
 		"debugServerPort": 1560,
 		"infoBaseAlias": "DefAlias",
 		"autoAttachTypes": [
 			"Client",
-			"Server",
-			"Job",
-			"JobFileMode"
+			"Server"
 		]
 	}
 	]
