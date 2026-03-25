@@ -60,7 +60,7 @@ function buildRequestBody(content: string): string {
 	return `<?xml version="1.0" encoding="UTF-8"?><request xmlns="${NS.debugRDBGRequestResponse}">${content}</request>`;
 }
 
-/** Формат step RDBG: default NS = debugBaseData, элементы RDBG с префиксом, id внутри targetID, два idOfDebuggerUI, без simple. */
+/** Формат step RDBG: default NS = debugBaseData, элементы RDBG с префиксом, id внутри targetID, два idOfDebuggerUI. */
 const STEP_REQUEST_NAMESPACES =
 	`xmlns="http://v8.1c.ru/8.3/debugger/debugBaseData" xmlns:cfg="http://v8.1c.ru/8.1/data/enterprise/current-config" xmlns:debugRDBGRequestResponse="${NS.debugRDBGRequestResponse}" xmlns:v8="http://v8.1c.ru/8.1/data/core" xmlns:xs="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"`;
 
@@ -68,12 +68,14 @@ function buildStepRequestBody(base: RDbgBaseRequest, targetId: DebugTargetIdLigh
 	const alias = escapeXml(base.infoBaseAlias);
 	const dbgui = escapeXml(base.idOfDebuggerUi);
 	const id = escapeXml(targetId.id);
+	const q = 'debugRDBGRequestResponse';
+	// Не передаём simple: в трафике после Step+simple=true цель уходит в state StopOnNextLine (как «шаг по строкам»), а не шаг с обходом.
 	return `<?xml version="1.0" encoding="UTF-8"?><request ${STEP_REQUEST_NAMESPACES}>` +
-		`<debugRDBGRequestResponse:infoBaseAlias>${alias}</debugRDBGRequestResponse:infoBaseAlias>` +
-		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
-		`<debugRDBGRequestResponse:idOfDebuggerUI>${dbgui}</debugRDBGRequestResponse:idOfDebuggerUI>` +
-		`<debugRDBGRequestResponse:targetID><id>${id}</id></debugRDBGRequestResponse:targetID>` +
-		`<debugRDBGRequestResponse:action>${action}</debugRDBGRequestResponse:action>` +
+		`<${q}:infoBaseAlias>${alias}</${q}:infoBaseAlias>` +
+		`<${q}:idOfDebuggerUI>${dbgui}</${q}:idOfDebuggerUI>` +
+		`<${q}:idOfDebuggerUI>${dbgui}</${q}:idOfDebuggerUI>` +
+		`<${q}:targetID><id>${id}</id></${q}:targetID>` +
+		`<${q}:action>${action}</${q}:action>` +
 		`</request>`;
 }
 

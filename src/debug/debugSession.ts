@@ -27,7 +27,14 @@ import { buildNestedEvalExpression, enrichEvalExprForCollections } from './evalE
 import { format1cv8cCommandLine, launch1cv8c, resolvePlatformBin } from './launch1cv8c';
 import { getVariableNamesFromProcedureAtLine } from './bslProcedureVariables';
 import { mapBaseBreakpointToExtensionLines } from './bslModuleStructure';
-import { getExtensionVersionHash, getExtendingModules, getModuleInfoByPath, getModulePathByModuleIdStr, getModulePathByObjectProperty } from './metadataProvider';
+import {
+	getExtensionVersionHash,
+	getExtendingModules,
+	getModuleInfoByPath,
+	getModulePathByModuleIdStr,
+	getModulePathFromStackPresentation,
+	getModulePathByObjectProperty,
+} from './metadataProvider';
 import { getDebugTimingConfig } from './debugTimingConfig';
 import { RdbgClient } from './rdbgClient';
 import {
@@ -177,6 +184,9 @@ export class OnecDebugSession extends DebugSession {
 	/** Дедупликация callStackFormed: не обрабатывать повторно, если тот же стек уже обработан недавно. */
 	private lastCallStackFormedAt = 0;
 	private lastCallStackFormedKey = '';
+	/** Последний шаг Step/StepIn/StepOut: защита от ложного targetQuit в ping до callStackFormed (после F10 цели не исчезали). */
+	private lastNonContinueStepAt = 0;
+	private lastNonContinueStepTargetId = '';
 	/** Дебаунс InvalidatedEvent(['variables']) при exprEvaluated — уменьшает частоту запросов переменных. */
 	private exprEvaluatedInvalidateTimer: ReturnType<typeof setTimeout> | undefined;
 	/** Дебаунс InvalidatedEvent при обновлении Watch — один событие вместо лавины при множественных выражениях (нагрузка на dbgs). */
@@ -502,11 +512,7 @@ export class OnecDebugSession extends DebugSession {
 				}
 			}
 			if (!sourcePath) {
-				// Fallback: активный редактор .bsl — при отладке пользователь обычно держит нужный модуль открытым
-				const active = vscode.window.activeTextEditor;
-				if (active?.document.fileName.toLowerCase().endsWith('.bsl')) {
-					sourcePath = active.document.uri.fsPath;
-				}
+				sourcePath = getModulePathFromStackPresentation(root, item.presentation ?? '', extensionName);
 			}
 			if (!sourcePath) {
 				const lineNo = item.lineNo ?? '?';
@@ -525,12 +531,12 @@ export class OnecDebugSession extends DebugSession {
 				selection: new vscode.Range(line0, 0, line0 + 1, 0),
 				preview: false,
 				viewColumn: vscode.ViewColumn.One,
-				preserveFocus: true, // Не переключать фокус с Call Stack — переменные появляются без повторного клика
+				preserveFocus: false,
 			});
 		}, 100);
 	}
 
-	/** После шага (F10/F11/Shift+F11) запрашивает getCallStack, отправляет StoppedEvent — IDE запросит evalLocalVariables и evalExpr (Watch). */
+	/** После шага (F10/F11/Shift+F11) запрашивает getCallStack, при устаревшем ответе — повторы по immediatePingDelaysMs; затем StoppedEvent и reveal. */
 	private scheduleRefreshStackAndReveal(threadId: number, stepInOrOut = false): void {
 		const existing = this.pendingStackRefreshTimeouts.get(threadId);
 		if (existing !== undefined) clearTimeout(existing);
@@ -538,29 +544,37 @@ export class OnecDebugSession extends DebugSession {
 		const target = this.targets[threadId - 1] ?? this.targets[0];
 		if (!this.rdbgClient || !this.attached || !target?.id) return;
 		const delayMs = stepInOrOut ? this.timingConfig.stepInOutDelayMs : this.timingConfig.varFetchDelayMs;
-		const timeoutId = setTimeout(async () => {
-			this.pendingStackRefreshTimeouts.delete(threadId);
+		const retryDelays = this.timingConfig.immediatePingDelaysMs;
+
+		const attemptStackRefresh = async (retryOrdinal: number): Promise<void> => {
+			if (!this.rdbgClient || !this.attached) return;
+			const t = this.targets[threadId - 1] ?? this.targets[0];
+			if (!t?.id) return;
 			try {
-				const stack = await this.rdbgClient!.getCallStack(
+				const stack = await this.rdbgClient.getCallStack(
 					{ infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId },
-					{ id: target.id },
+					{ id: t.id },
 				);
-				if (stack.length > 0) {
-					const current = this.threadsCallStack.get(threadId) ?? [];
-					const stackChanged = !this.isCallStackEqual(current, stack);
-					if (stackChanged) {
-						this.threadsCallStack.set(threadId, stack);
-						// Не очищаем evalExprCache — при InvalidatedEvent возвращаем кэш, пока сервер не ответит. Иначе переменные «обнуляются» при быстром F11.
-						const stoppedEv = new StoppedEvent('step', threadId);
-						(stoppedEv as { body: Record<string, unknown> }).body.preserveFocusHint = true;
-						this.sendEvent(stoppedEv);
-						this.sendEvent(new InvalidatedEvent(['stack', 'variables']));
-						this.revealCurrentFrameInEditor(threadId);
-					}
+				const current = this.threadsCallStack.get(threadId) ?? [];
+				const stackChanged = stack.length > 0 && !this.isCallStackEqual(current, stack);
+				if (stackChanged) {
+					this.threadsCallStack.set(threadId, stack);
+					// Не очищаем evalExprCache — при InvalidatedEvent возвращаем кэш, пока сервер не ответит. Иначе переменные «обнуляются» при быстром F11.
+					const stoppedEv = new StoppedEvent('step', threadId);
+					this.sendEvent(stoppedEv);
+					this.sendEvent(new InvalidatedEvent(['stack', 'variables']));
+					this.revealCurrentFrameInEditor(threadId);
+				} else if (retryOrdinal < retryDelays.length && (stack.length === 0 || !stackChanged)) {
+					setTimeout(() => void attemptStackRefresh(retryOrdinal + 1), retryDelays[retryOrdinal]);
 				}
 			} catch {
 				// игнорируем
 			}
+		};
+
+		const timeoutId = setTimeout(() => {
+			this.pendingStackRefreshTimeouts.delete(threadId);
+			void attemptStackRefresh(0);
 		}, delayMs);
 		this.pendingStackRefreshTimeouts.set(threadId, timeoutId);
 	}
@@ -634,7 +648,6 @@ export class OnecDebugSession extends DebugSession {
 		this.threadsCallStack.set(threadId, stackOrdered);
 		// Не очищаем evalExprCache на step — иначе Watch показывает «Неопределено» пока сервер не ответит на evalExpr.
 		const stoppedEv = new StoppedEvent(csf.reason, threadId);
-		(stoppedEv as { body: Record<string, unknown> }).body.preserveFocusHint = true;
 		this.sendEvent(stoppedEv);
 		this.sendEvent(new InvalidatedEvent(['stack', 'variables']));
 		this.revealCurrentFrameInEditor(threadId);
@@ -782,7 +795,7 @@ export class OnecDebugSession extends DebugSession {
 		}
 	}
 
-	/** Сравнение двух стеков по ключевым полям (presentation, lineNo, moduleId). Если равны — не слать InvalidatedEvent, чтобы не терять контекст и не дергать запросы переменных. */
+	/** Сравнение двух стеков по ключевым полям (presentation, lineNo, moduleId, moduleIdStr, расширение). Если равны — не слать повторный refresh после шага. */
 	private isCallStackEqual(a: StackItemViewInfoData[], b: StackItemViewInfoData[]): boolean {
 		if (a.length !== b.length) return false;
 		for (let i = 0; i < a.length; i++) {
@@ -797,6 +810,10 @@ export class OnecDebugSession extends DebugSession {
 			const propA = ai.moduleId?.propertyId ?? '';
 			const propB = bi.moduleId?.propertyId ?? '';
 			if (objA !== objB || propA !== propB) return false;
+			const extA = String(ai.moduleId?.extensionName ?? '').trim();
+			const extB = String(bi.moduleId?.extensionName ?? '').trim();
+			if (extA !== extB) return false;
+			if (String(ai.moduleIdStr ?? '').trim() !== String(bi.moduleIdStr ?? '').trim()) return false;
 		}
 		return true;
 	}
@@ -933,8 +950,13 @@ export class OnecDebugSession extends DebugSession {
 				const isSteppedTargetInQuit = result.callStackFormed && this.targets.length === 1
 					&& result.targetQuit.some(t => t.id === this.targets[0]?.id);
 				let hadQuit = false;
+				const targetQuitGraceMs = 800;
+				const inStepGrace =
+					Date.now() - this.lastNonContinueStepAt < targetQuitGraceMs &&
+					this.lastNonContinueStepTargetId.trim() !== '';
 				for (const target of result.targetQuit) {
 					if (!target.id?.trim() || target.id === steppedTargetId || isSteppedTargetInQuit) continue;
+					if (inStepGrace && target.id === this.lastNonContinueStepTargetId) continue;
 					const index = this.targets.findIndex(t => t.id === target.id);
 					if (index >= 0) {
 						const threadId = index + 1;
@@ -1524,6 +1546,9 @@ export class OnecDebugSession extends DebugSession {
 				if (!sourcePath && item.moduleIdStr?.trim()) {
 					sourcePath = getModulePathByModuleIdStr(root, item.moduleIdStr, extName);
 				}
+				if (!sourcePath) {
+					sourcePath = getModulePathFromStackPresentation(root, item.presentation ?? '', extName);
+				}
 				if (sourcePath && item.moduleId?.propertyId === 'a637f77f-3840-441d-a1c3-699c8c5cb7e0') {
 					const pres = (item.presentation ?? '').trim();
 					if (pres && extName === '') {
@@ -1812,10 +1837,7 @@ export class OnecDebugSession extends DebugSession {
 							modulePath = getModulePathByModuleIdStr(root, item.moduleIdStr, extName);
 						}
 						if (!modulePath) {
-							const active = vscode.window.activeTextEditor;
-							if (active?.document.fileName.toLowerCase().endsWith('.bsl')) {
-								modulePath = active.document.uri.fsPath;
-							}
+							modulePath = getModulePathFromStackPresentation(root, item.presentation ?? '', extName);
 						}
 						const lineNo = typeof item.lineNo === 'number' ? item.lineNo : parseInt(String(item.lineNo ?? 0), 10) || 1;
 						if (modulePath) {
@@ -1872,6 +1894,7 @@ export class OnecDebugSession extends DebugSession {
 	): Promise<void> {
 		await this.sendStepAction('Step', args.threadId);
 		this.scheduleRefreshStackAndReveal(args.threadId);
+		this.scheduleImmediatePingForCallStack(args.threadId);
 		this.sendResponse(response);
 	}
 
@@ -1907,6 +1930,10 @@ export class OnecDebugSession extends DebugSession {
 		}
 		const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
 		try {
+			if (action === 'Continue') {
+				this.lastNonContinueStepAt = 0;
+				this.lastNonContinueStepTargetId = '';
+			}
 			// rdbg setBreakOnNextStatement перед step — не требует targetIDStr.
 			if (action !== 'Continue') {
 				try {
@@ -1916,6 +1943,10 @@ export class OnecDebugSession extends DebugSession {
 				}
 			}
 			const stepResponse = await this.rdbgClient.step(base, { id: target.id }, action);
+			if (action !== 'Continue') {
+				this.lastNonContinueStepAt = Date.now();
+				this.lastNonContinueStepTargetId = target.id;
+			}
 			this.mergeTargetIDStrFromResponse(stepResponse);
 			// evalExprStartStop — управление вычислениями на сервере, снижает память dbgs.exe. По умолчанию выключен — на части платформ может завершать отладку.
 			const evalExprStartStopEnabled = vscode.workspace.getConfiguration('1c-dev-tools').get<boolean>('debug.evalExprStartStopEnabled', false);

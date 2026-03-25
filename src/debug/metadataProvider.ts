@@ -478,6 +478,69 @@ export function getModulePathByModuleIdStr(workspaceRoot: string, moduleIdStr: s
 }
 
 /**
+ * Из текста presentation кадра стека (до «(») извлекает moduleIdString и ищет путь к .bsl через кэш.
+ * Нужен, когда objectID из RDBG не совпадает с UUID в локальной выгрузке, а moduleIDStr в ответе — нечитаемый/пустой после декодирования.
+ */
+export function getModulePathFromStackPresentation(
+	workspaceRoot: string,
+	presentation: string,
+	extensionName?: string,
+): string {
+	if (!workspaceRoot || !presentation?.trim()) return '';
+	const head = presentation.split('(')[0].trim();
+	const ext = extensionName;
+	const byId = (moduleIdStr: string): string => getModulePathByModuleIdStr(workspaceRoot, moduleIdStr, ext);
+
+	const cm = head.match(/^ОбщийМодуль\.([^.]+)\.Модуль(?:\.|\(|$)/i);
+	if (cm) {
+		const p = byId(`ОбщийМодуль.${cm[1]}.Модуль`);
+		if (p) return p;
+	}
+	const web = head.match(/^ВебСервис\.([^.]+)\.Модуль(?:\.|\(|$)/i);
+	if (web) {
+		const p = byId(`ВебСервис.${web[1]}.Модуль`);
+		if (p) return p;
+	}
+	const http = head.match(/^HTTPСервис\.([^.]+)\.Модуль(?:\.|\(|$)/i);
+	if (http) {
+		const p = byId(`HTTPСервис.${http[1]}.Модуль`);
+		if (p) return p;
+	}
+	const objTypes = [
+		['Обработка', 'МодульОбъекта'],
+		['Отчет', 'МодульОбъекта'],
+		['Документ', 'МодульОбъекта'],
+		['Справочник', 'МодульОбъекта'],
+	] as const;
+	for (const [t, suf] of objTypes) {
+		const re = new RegExp(`^${t}\\.([^.]+)\\.${suf}(?:\\.|\\(|$)`, 'i');
+		const m = head.match(re);
+		if (m) {
+			const p = byId(`${t}.${m[1]}.${suf}`);
+			if (p) return p;
+		}
+	}
+	const mgrTypes = [
+		['Документ', 'МодульМенеджера'],
+		['Справочник', 'МодульМенеджера'],
+	] as const;
+	for (const [t, suf] of mgrTypes) {
+		const re = new RegExp(`^${t}\\.([^.]+)\\.${suf}(?:\\.|\\(|$)`, 'i');
+		const m = head.match(re);
+		if (m) {
+			const p = byId(`${t}.${m[1]}.${suf}`);
+			if (p) return p;
+		}
+	}
+	const fm = head.match(/^(Обработка|Отчет|Документ|Справочник)\.([^.]+)\.Форма\.([^.]+)\.Форма(?:\.|\(|$)/i);
+	if (fm) {
+		const p = byId(`${fm[1]}.${fm[2]}.Форма.${fm[3]}.Форма`);
+		if (p) return p;
+	}
+	return '';
+}
+
+/**
  * Проверяет, что модуль расширения использует &ИзменениеИКонтроль или &Вместо (первые 20 строк).
  * В этом случае точки останова работают только в расширении. При &После или &Перед — работают в базе и расширении.
  */
