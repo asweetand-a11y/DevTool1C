@@ -76,7 +76,7 @@
 
 ## Настройка
 
-Примеры файлов packagedef + env.json в репозитории.
+Примеры файлов packagedef + env.json + oscript_modules в репозитории https://github.com/asweetand-a11y/DevTool1C.
 
 Расширение автоматически активируется при открытии проекта 1С (наличие файла `packagedef` в корне проекта).
 
@@ -104,7 +104,7 @@
 }
 ```
 
-В папку с проектом скопировать oscript_modules для подмены модулей onescript. Оригиналы можно взять https://github.com/asweetand-a11y/DevTool1C
+В папку с проектом скопировать oscript_modules для подмены модулей onescript. Оригиналы можно взять https://github.com/asweetand-a11y/DevTool1C.
 
 ### Параметры отладки модулей BSL (утилита dbgs.exe)
 
