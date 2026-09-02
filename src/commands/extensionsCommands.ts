@@ -12,6 +12,7 @@ import {
 	getBuildExtensionCommandName,
 	getDecompileExtensionCommandName
 } from '../commandNames';
+import { parseCommitPathLine, toDesignerListFilePath } from '../utils/commitPath';
 
 /**
  * Команды для работы с расширениями конфигурации
@@ -30,7 +31,8 @@ export class ExtensionsCommands extends BaseCommand {
 	 * @returns Промис, который разрешается массивом имен папок расширений или undefined при ошибке
 	 */
 	/**
-	 * Фильтрует строки из Commit.txt, оставляя только те, которые относятся к указанному расширению
+	 * Фильтрует строки из Commit.txt для указанного расширения и приводит пути к формату -listFile
+	 * (относительно src/cfe/<имя>), учитывая абсолютные, относительные и «от корня выгрузки» варианты.
 	 * 
 	 * Путь к файлу расширения должен содержать подстроку `src/cfe/<ИмяРасширения>/`.
 	 * Пути могут быть относительными (от workspace root) или абсолютными.
@@ -47,8 +49,7 @@ export class ExtensionsCommands extends BaseCommand {
 		workspaceRoot: string
 	): Promise<string> {
 		const fs = await import('node:fs/promises');
-		
-		// Читаем исходный файл Commit.txt
+
 		let commitContent: string;
 		try {
 			commitContent = await fs.readFile(commitPath, 'utf-8');
@@ -56,33 +57,36 @@ export class ExtensionsCommands extends BaseCommand {
 			throw new Error(`Не удалось прочитать файл Commit.txt: ${(error as Error).message}`);
 		}
 
-		// Разбиваем на строки
+		const context = {
+			workspaceRoot,
+			srcPath: this.vrunner.getSrcPath(),
+			cfePath: this.vrunner.getCfePath()
+		};
+
 		const lines = commitContent.split(/\r?\n/);
-		
-		// Фильтруем строки, оставляя только те, которые относятся к указанному расширению
 		const filteredLines: string[] = [];
-		const extensionPathPattern = `src/cfe/${extensionName}/`.toLowerCase();
-		
+		const seen = new Set<string>();
+
 		for (const line of lines) {
-			// Пропускаем пустые строки и комментарии
-			const trimmedLine = line.trim();
-			if (trimmedLine === '' || trimmedLine.startsWith('REM')) {
+			const parsed = parseCommitPathLine(line, context);
+			if (!parsed || parsed.kind !== 'cfe') {
+				continue;
+			}
+			if (parsed.extensionName?.toLowerCase() !== extensionName.toLowerCase()) {
 				continue;
 			}
 
-			// Нормализуем путь для сравнения (заменяем обратные слэши на прямые, приводим к нижнему регистру)
-			const normalizedLine = line.replace(/\\/g, '/').toLowerCase();
-			
-			// Проверяем, содержит ли путь подстроку для расширения
-			if (normalizedLine.includes(extensionPathPattern)) {
-				filteredLines.push(line);
+			const listPath = toDesignerListFilePath(parsed.relativePath);
+			const key = listPath.toLowerCase();
+			if (seen.has(key)) {
+				continue;
 			}
+			seen.add(key);
+			filteredLines.push(listPath);
 		}
 
-		// Создаем временный файл в папке build/commit/
 		const buildCommitDir = path.join(workspaceRoot, 'build', 'commit');
-		
-		// Создаем папку, если её нет
+
 		try {
 			await fs.mkdir(buildCommitDir, { recursive: true });
 		} catch (error) {
@@ -92,7 +96,6 @@ export class ExtensionsCommands extends BaseCommand {
 		const tempFileName = `Commit_${extensionName}.txt`;
 		const tempFilePath = path.join(buildCommitDir, tempFileName);
 
-		// Записываем отфильтрованные строки во временный файл
 		try {
 			await fs.writeFile(tempFilePath, filteredLines.join('\n'), 'utf-8');
 		} catch (error) {

@@ -20,8 +20,9 @@ export type ExternalFileType = 'processor' | 'report';
 export class ExternalFilesCommands extends BaseCommand {
 
 	/**
-	 * Собирает внешний файл (обработку или отчет) из исходников
-	 * Выполняет команду v8runner-cli.os loadExternalFiles для каждой подпапки в исходниках.
+	 * Собирает внешний файл (обработку или отчет) из исходников.
+	 * Выполняет команду v8runner-cli.os loadExternalFiles для выбранной подпапки в {@code src/epf} или {@code src/erf}.
+	 * Если подпапок с корневым XML несколько — предлагает выбрать одну.
 	 * В --src передаётся корневой XML рядом с подпапкой: {@code src/epf/<ИмяПодпапки>.xml} (платформа 1С ожидает файл, не каталог).
 	 * @param fileType - Тип файла: 'processor' для обработок, 'report' для отчетов
 	 * @returns Промис, который разрешается после запуска команды
@@ -55,58 +56,75 @@ export class ExternalFilesCommands extends BaseCommand {
 			? getBuildExternalProcessorCommandName()
 			: getBuildExternalReportCommandName();
 
-		// Получаем список всех подпапок в srcFolder
 		const entries = await fs.readdir(srcPath, { withFileTypes: true });
 		const folders = entries.filter(entry => entry.isDirectory()).map(entry => entry.name);
 
-		if (folders.length === 0) {
-			vscode.window.showWarningMessage(`В папке ${srcFolder} не найдено подпапок для сборки`);
-			return;
-		}
-
-		// Для каждой подпапки: корневой выгрузки для конфигуратора — файл <ИмяПодпапки>.xml в каталоге epf/erf
+		const foldersWithXml: string[] = [];
 		for (const folder of folders) {
 			const rootXmlPath = path.join(workspaceRoot, srcFolder, `${folder}.xml`);
 			try {
 				await fs.access(rootXmlPath);
+				foldersWithXml.push(folder);
 			} catch {
-				vscode.window.showWarningMessage(
-					`Пропуск «${folder}»: не найден корневой XML «${path.join(srcFolder, `${folder}.xml`)}». Ожидается файл рядом с подпапкой исходников.`
-				);
-				continue;
+				// Подпапка без корневого XML не является исходниками внешней обработки/отчёта
 			}
-
-			const outputFileName = `${folder}.${fileType === 'processor' ? 'epf' : 'erf'}`;
-			const outputFilePath = path.join(workspaceRoot, outputFolder, outputFileName);
-
-			const args = [
-				'loadExternalFiles',
-				'--ibconnection', ibParams.connection,
-				'--src', rootXmlPath,
-				'--file', outputFilePath
-			];
-
-			if (ibParams.username) {
-				args.push('--db-user', ibParams.username);
-			}
-			if (ibParams.password) {
-				args.push('--db-pwd', ibParams.password);
-			}
-
-			this.vrunner.executeOscriptInTerminal(
-				'oscript_modules/v8runner/src/v8runner-cli.os',
-				args,
-				{
-					cwd: workspaceRoot,
-					name: commandName.title
-				}
-			);
 		}
+
+		if (foldersWithXml.length === 0) {
+			vscode.window.showWarningMessage(
+				`В папке ${srcFolder} не найдено исходников для сборки (нужны подпапка и файл <Имя>.xml рядом с ней)`
+			);
+			return;
+		}
+
+		foldersWithXml.sort((a, b) => a.localeCompare(b, 'ru'));
+
+		let selectedFolder: string | undefined;
+		if (foldersWithXml.length === 1) {
+			selectedFolder = foldersWithXml[0];
+		} else {
+			const itemLabel = fileType === 'processor' ? 'обработку' : 'отчет';
+			selectedFolder = await vscode.window.showQuickPick(foldersWithXml, {
+				placeHolder: `Выберите ${itemLabel} для сборки`,
+				title: commandName.title
+			});
+			if (!selectedFolder) {
+				return;
+			}
+		}
+
+		const rootXmlPath = path.join(workspaceRoot, srcFolder, `${selectedFolder}.xml`);
+		const outputFileName = `${selectedFolder}.${fileType === 'processor' ? 'epf' : 'erf'}`;
+		const outputFilePath = path.join(workspaceRoot, outputFolder, outputFileName);
+
+		const args = [
+			'loadExternalFiles',
+			'--ibconnection', ibParams.connection,
+			'--src', rootXmlPath,
+			'--file', outputFilePath
+		];
+
+		if (ibParams.username) {
+			args.push('--db-user', ibParams.username);
+		}
+		if (ibParams.password) {
+			args.push('--db-pwd', ibParams.password);
+		}
+
+		this.vrunner.executeOscriptInTerminal(
+			'oscript_modules/v8runner/src/v8runner-cli.os',
+			args,
+			{
+				cwd: workspaceRoot,
+				name: commandName.title
+			}
+		);
 	}
 
 	/**
-	 * Разбирает внешний файл (обработку или отчет) из .epf/.erf в исходники
-	 * Выполняет команду v8runner-cli.os dumpExternalFiles для каждого файла в папке
+	 * Разбирает внешний файл (обработку или отчет) из .epf/.erf в исходники.
+	 * Берёт файлы из {@code build/out/epf} или {@code build/out/erf}. Если файлов несколько — предлагает выбрать один.
+	 * Исходники выгружаются в корень {@code src/epf} или {@code src/erf} без промежуточной папки с именем файла.
 	 * @param fileType - Тип файла: 'processor' для обработок, 'report' для отчетов
 	 * @returns Промис, который разрешается после запуска команды
 	 */
@@ -152,35 +170,46 @@ export class ExternalFilesCommands extends BaseCommand {
 			return;
 		}
 
-		// Для каждого файла создаем команду разбора
-		for (const file of files) {
-			const inputFilePath = path.join(workspaceRoot, inputPath, file);
-			const fileNameWithoutExt = path.parse(file).name;
-			const outputFolderPath = path.join(workspaceRoot, outputPath, fileNameWithoutExt);
+		files.sort((a, b) => a.localeCompare(b, 'ru'));
 
-			const args = [
-				'dumpExternalFiles',
-				'--ibconnection', ibParams.connection,
-				'--out', outputFolderPath,
-				'--file', inputFilePath
-			];
-
-			if (ibParams.username) {
-				args.push('--db-user', ibParams.username);
+		let selectedFile: string | undefined;
+		if (files.length === 1) {
+			selectedFile = files[0];
+		} else {
+			const itemLabel = fileType === 'processor' ? 'обработку' : 'отчет';
+			selectedFile = await vscode.window.showQuickPick(files, {
+				placeHolder: `Выберите ${itemLabel} для разбора`,
+				title: commandName.title
+			});
+			if (!selectedFile) {
+				return;
 			}
-			if (ibParams.password) {
-				args.push('--db-pwd', ibParams.password);
-			}
-
-			this.vrunner.executeOscriptInTerminal(
-				'oscript_modules/v8runner/src/v8runner-cli.os',
-				args,
-				{
-					cwd: workspaceRoot,
-					name: commandName.title
-				}
-			);
 		}
+
+		const inputFilePath = path.join(workspaceRoot, inputPath, selectedFile);
+
+		const args = [
+			'dumpExternalFiles',
+			'--ibconnection', ibParams.connection,
+			'--out', outputFullPath,
+			'--file', inputFilePath
+		];
+
+		if (ibParams.username) {
+			args.push('--db-user', ibParams.username);
+		}
+		if (ibParams.password) {
+			args.push('--db-pwd', ibParams.password);
+		}
+
+		this.vrunner.executeOscriptInTerminal(
+			'oscript_modules/v8runner/src/v8runner-cli.os',
+			args,
+			{
+				cwd: workspaceRoot,
+				name: commandName.title
+			}
+		);
 	}
 
 	/**

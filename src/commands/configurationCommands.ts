@@ -14,6 +14,7 @@ import {
 	getBuildConfigurationCommandName,
 	getDecompileConfigurationCommandName
 } from '../commandNames';
+import { parseCommitPathLine, toDesignerListFilePath } from '../utils/commitPath';
 
 /**
  * Команды для работы с конфигурацией
@@ -163,7 +164,8 @@ export class ConfigurationCommands extends BaseCommand {
 	 * @returns Промис, который разрешается после запуска команды
 	 */
 	/**
-	 * Фильтрует строки из Commit.txt, оставляя только те, которые относятся к основной конфигурации
+	 * Фильтрует строки из Commit.txt для основной конфигурации и приводит пути к формату -listFile
+	 * (относительно src/cf), учитывая абсолютные, относительные и «от корня выгрузки» варианты.
 	 * 
 	 * Путь к файлу основной конфигурации должен содержать `src/cf/` и НЕ должен содержать `src/cfe/`.
 	 * Пути могут быть относительными (от workspace root) или абсолютными.
@@ -178,8 +180,7 @@ export class ConfigurationCommands extends BaseCommand {
 		workspaceRoot: string
 	): Promise<string> {
 		const fs = await import('node:fs/promises');
-		
-		// Читаем исходный файл Commit.txt
+
 		let commitContent: string;
 		try {
 			commitContent = await fs.readFile(commitPath, 'utf-8');
@@ -187,34 +188,33 @@ export class ConfigurationCommands extends BaseCommand {
 			throw new Error(`Не удалось прочитать файл Commit.txt: ${(error as Error).message}`);
 		}
 
-		// Разбиваем на строки
+		const context = {
+			workspaceRoot,
+			srcPath: this.vrunner.getSrcPath(),
+			cfePath: this.vrunner.getCfePath()
+		};
+
 		const lines = commitContent.split(/\r?\n/);
-		
-		// Фильтруем строки, оставляя только те, которые относятся к основной конфигурации
 		const filteredLines: string[] = [];
-		const baseConfigPathPattern = 'src/cf/'.toLowerCase();
-		const extensionPathPattern = 'src/cfe/'.toLowerCase();
-		
+		const seen = new Set<string>();
+
 		for (const line of lines) {
-			// Пропускаем пустые строки и комментарии
-			const trimmedLine = line.trim();
-			if (trimmedLine === '' || trimmedLine.startsWith('REM')) {
+			const parsed = parseCommitPathLine(line, context);
+			if (!parsed || parsed.kind === 'cfe') {
 				continue;
 			}
 
-			// Нормализуем путь для сравнения (заменяем обратные слэши на прямые, приводим к нижнему регистру)
-			const normalizedLine = line.replace(/\\/g, '/').toLowerCase();
-			
-			// Проверяем, содержит ли путь src/cf/ и НЕ содержит src/cfe/
-			if (normalizedLine.includes(baseConfigPathPattern) && !normalizedLine.includes(extensionPathPattern)) {
-				filteredLines.push(line);
+			const listPath = toDesignerListFilePath(parsed.relativePath);
+			const key = listPath.toLowerCase();
+			if (seen.has(key)) {
+				continue;
 			}
+			seen.add(key);
+			filteredLines.push(listPath);
 		}
 
-		// Создаем временный файл в папке build/commit/
 		const buildCommitDir = path.join(workspaceRoot, 'build', 'commit');
-		
-		// Создаем папку, если её нет
+
 		try {
 			await fs.mkdir(buildCommitDir, { recursive: true });
 		} catch (error) {
@@ -224,7 +224,6 @@ export class ConfigurationCommands extends BaseCommand {
 		const tempFileName = 'Commit_Base.txt';
 		const tempFilePath = path.join(buildCommitDir, tempFileName);
 
-		// Записываем отфильтрованные строки во временный файл
 		try {
 			await fs.writeFile(tempFilePath, filteredLines.join('\n'), 'utf-8');
 		} catch (error) {
