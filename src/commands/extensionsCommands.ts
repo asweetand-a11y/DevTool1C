@@ -105,46 +105,110 @@ export class ExtensionsCommands extends BaseCommand {
 		return tempFilePath;
 	}
 
-	private async getExtensionFoldersFromSrc(workspaceRoot: string): Promise<string[] | undefined> {
+	private async getExtensionFoldersFromSrc(workspaceRoot: string, silent = false): Promise<string[] | undefined> {
 		const cfePath = this.vrunner.getCfePath();
-		const extensionsSrcPath = path.join(workspaceRoot, cfePath);
+		const extensionsSrcPath = path.isAbsolute(cfePath)
+			? cfePath
+			: path.join(workspaceRoot, cfePath);
 
-		if (!(await this.checkDirectoryExists(extensionsSrcPath, `Папка ${cfePath} не является директорией`))) {
-			return undefined;
-		}
-
-		// Получаем все директории в папке расширений
-		const allDirectories = await this.getDirectories(extensionsSrcPath, `Ошибка при чтении папки ${cfePath}`);
-		if (allDirectories.length === 0) {
-			vscode.window.showInformationMessage(`В папке ${cfePath} не найдено расширений`);
-			return undefined;
-		}
-
-		// Фильтруем: оставляем только папки, которые содержат Configuration.xml
-		// Это признак того, что папка является расширением, а не подпапкой внутри расширения
-		const extensionFolders: string[] = [];
 		const fs = await import('node:fs/promises');
+		try {
+			const stat = await fs.stat(extensionsSrcPath);
+			if (!stat.isDirectory()) {
+				if (!silent) {
+					vscode.window.showErrorMessage(`Папка ${cfePath} не является директорией`);
+				}
+				return silent ? [] : undefined;
+			}
+		} catch {
+			if (!silent) {
+				vscode.window.showErrorMessage(`Папка ${cfePath} не является директорией`);
+			}
+			return silent ? [] : undefined;
+		}
+
+		const allDirectories = await this.getDirectories(extensionsSrcPath, silent ? undefined : `Ошибка при чтении папки ${cfePath}`);
+		if (allDirectories.length === 0) {
+			if (!silent) {
+				vscode.window.showInformationMessage(`В папке ${cfePath} не найдено расширений`);
+			}
+			return silent ? [] : undefined;
+		}
+
+		const extensionFolders: string[] = [];
 
 		for (const dir of allDirectories) {
-			const dirPath = path.join(extensionsSrcPath, dir);
-			const configXmlPath = path.join(dirPath, 'Configuration.xml');
-			
+			const configXmlPath = path.join(extensionsSrcPath, dir, 'Configuration.xml');
 			try {
 				await fs.access(configXmlPath);
-				// Файл Configuration.xml существует - это расширение
 				extensionFolders.push(dir);
 			} catch {
-				// Файл не найден - это не расширение, пропускаем
 				continue;
 			}
 		}
 
 		if (extensionFolders.length === 0) {
-			vscode.window.showInformationMessage(`В папке ${cfePath} не найдено расширений (папки с файлом Configuration.xml)`);
-			return undefined;
+			if (!silent) {
+				vscode.window.showInformationMessage(`В папке ${cfePath} не найдено расширений (папки с файлом Configuration.xml)`);
+			}
+			return silent ? [] : undefined;
 		}
 
 		return extensionFolders;
+	}
+
+	/**
+	 * Возвращает один элемент списка: без вопроса, если он единственный, иначе Quick Pick.
+	 * @param items - Имена расширений или файлов .cfe
+	 * @param placeHolder - Подсказка в поле выбора
+	 * @param title - Заголовок панели выбора
+	 * @returns Выбранный элемент или undefined при отмене
+	 */
+	private async pickOne(items: string[], placeHolder: string, title: string): Promise<string | undefined> {
+		const sorted = [...items].sort((a, b) => a.localeCompare(b, 'ru'));
+		if (sorted.length === 1) {
+			return sorted[0];
+		}
+
+		return vscode.window.showQuickPick(sorted, {
+			placeHolder,
+			title
+		});
+	}
+
+	/**
+	 * Определяет имя расширения для выгрузки из ИБ: папки src/cfe, иначе .cfe в build, иначе ввод имени.
+	 * @param workspaceRoot - Корень проекта
+	 * @param commandTitle - Заголовок команды для панели выбора
+	 * @returns Имя расширения или undefined
+	 */
+	private async resolveExtensionNameForDump(workspaceRoot: string, commandTitle: string): Promise<string | undefined> {
+		const fromSrc = await this.getExtensionFoldersFromSrc(workspaceRoot, true);
+		if (fromSrc && fromSrc.length > 0) {
+			return this.pickOne(fromSrc, 'Выберите расширение', commandTitle);
+		}
+
+		const buildPath = this.vrunner.getBuildPath();
+		const cfeBuildPath = path.join(workspaceRoot, buildPath, 'cfe');
+		const fs = await import('node:fs/promises');
+		try {
+			await fs.access(cfeBuildPath);
+			const cfeFiles = await this.getFilesByExtension(cfeBuildPath, '.cfe');
+			if (cfeFiles.length > 0) {
+				const names = cfeFiles.map(file => file.replace(/\.cfe$/i, ''));
+				return this.pickOne(names, 'Выберите расширение', commandTitle);
+			}
+		} catch {
+			// Каталога build/out/cfe ещё нет — имя расширения запросим вручную
+		}
+
+		const typed = await vscode.window.showInputBox({
+			title: commandTitle,
+			prompt: 'Введите имя расширения',
+			placeHolder: 'ИмяРасширения'
+		});
+		const name = typed?.trim();
+		return name === '' ? undefined : name;
 	}
 
 	/**
@@ -159,7 +223,7 @@ export class ExtensionsCommands extends BaseCommand {
 	 * Загружает расширения из исходников в информационную базу
 	 * 
 	 * Находит все папки расширений в src/cfe (содержащие Configuration.xml) и загружает их
-	 * через v8runner-cli.os. Использует параметр -AllExtensions для загрузки всех расширений
+	 * через v8runner-cli.os. Если расширений несколько — предлагает выбрать одно.
 	 * одним вызовом.
 	 * 
 	 * @returns Промис, который разрешается после запуска команды
@@ -180,14 +244,20 @@ export class ExtensionsCommands extends BaseCommand {
 			return;
 		}
 
-		const extensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
-		if (!extensionFolders) {
+		const allExtensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
+		if (!allExtensionFolders) {
 			return;
 		}
 
 		const cfePath = this.vrunner.getCfePath();
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getLoadExtensionFromSrcCommandName();
+
+		const selectedExtension = await this.pickOne(allExtensionFolders, 'Выберите расширение', commandName.title);
+		if (!selectedExtension) {
+			return;
+		}
+		const extensionFolders = [selectedExtension];
 
 		// Путь к универсальному CLI скрипту v8runner
 		const scriptPath = path.join(workspaceRoot, 'oscript_modules', 'v8runner', 'src', 'v8runner-cli.os');
@@ -323,14 +393,20 @@ export class ExtensionsCommands extends BaseCommand {
 			return;
 		}
 
-		const cfeFiles = await this.getFilesByExtension(cfePath, '.cfe', `Ошибка при чтении папки ${buildPath}/cfe`);
-		if (cfeFiles.length === 0) {
+		const allCfeFiles = await this.getFilesByExtension(cfePath, '.cfe', `Ошибка при чтении папки ${buildPath}/cfe`);
+		if (allCfeFiles.length === 0) {
 			vscode.window.showInformationMessage(`В папке ${buildPath}/cfe не найдено файлов .cfe`);
 			return;
 		}
 
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getLoadExtensionFromCfeCommandName();
+
+		const selectedCfeFile = await this.pickOne(allCfeFiles, 'Выберите расширение', commandName.title);
+		if (!selectedCfeFile) {
+			return;
+		}
+		const cfeFiles = [selectedCfeFile];
 
 		// Путь к универсальному CLI скрипту v8runner
 		const scriptPath = path.join(workspaceRoot, 'oscript_modules', 'v8runner', 'src', 'v8runner-cli.os');
@@ -417,7 +493,7 @@ export class ExtensionsCommands extends BaseCommand {
 	/**
 	 * Выгружает расширения из информационной базы в исходники
 	 * 
-	 * Использует команду конфигуратора /DumpConfigToFiles с параметром -AllExtensions
+	 * Выгружает выбранное расширение командой конфигуратора /DumpConfigToFiles -Extension
 	 * для автоматической выгрузки всех расширений из конфигурации 1С в отдельные каталоги.
 	 * Каждое расширение выгружается в каталог со своим именем в папке src/cfe.
 	 * 
@@ -426,7 +502,7 @@ export class ExtensionsCommands extends BaseCommand {
 	/**
 	 * Выгружает расширения из информационной базы в исходники
 	 * 
-	 * Использует команду конфигуратора /DumpConfigToFiles с параметром -AllExtensions
+	 * Выгружает выбранное расширение командой конфигуратора /DumpConfigToFiles -Extension
 	 * для автоматической выгрузки всех расширений из конфигурации 1С в отдельные каталоги.
 	 * Каждое расширение выгружается в каталог со своим именем в папке src/cfe.
 	 * 
@@ -440,12 +516,17 @@ export class ExtensionsCommands extends BaseCommand {
 
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getDumpExtensionToSrcCommandName();
+
+		const extensionName = await this.resolveExtensionNameForDump(workspaceRoot, commandName.title);
+		if (!extensionName) {
+			return;
+		}
+
 		const cfePath = this.vrunner.getCfePath();
-		
-		// Формируем абсолютный путь к каталогу выгрузки
-		const absoluteCfePath = path.isAbsolute(cfePath) 
-			? cfePath 
+		const absoluteCfeRoot = path.isAbsolute(cfePath)
+			? cfePath
 			: path.join(workspaceRoot, cfePath);
+		const absoluteCfePath = path.join(absoluteCfeRoot, extensionName);
 		
 		// Путь к универсальному CLI скрипту v8runner
 		const scriptPath = path.join(workspaceRoot, 'oscript_modules', 'v8runner', 'src', 'v8runner-cli.os');
@@ -460,6 +541,13 @@ export class ExtensionsCommands extends BaseCommand {
 			);
 			return;
 		}
+
+		try {
+			await fs.mkdir(absoluteCfePath, { recursive: true });
+		} catch (error) {
+			vscode.window.showErrorMessage(`Ошибка при создании папки ${absoluteCfePath}: ${(error as Error).message}`);
+			return;
+		}
 		
 		// Получаем путь к oscript
 		const onescriptPath = this.vrunner.getOnescriptPath();
@@ -472,7 +560,7 @@ export class ExtensionsCommands extends BaseCommand {
 			'--db-user', ibParams.username,
 			'--db-pwd', ibParams.password,
 			'--out', absoluteCfePath,
-			'--extension', '-AllExtensions'
+			'--extension', extensionName
 		];
 		
 		// Выполняем oscript скрипт в терминале
@@ -503,7 +591,7 @@ export class ExtensionsCommands extends BaseCommand {
 	/**
 	 * Выгружает обновление расширений из информационной базы в исходники
 	 * 
-	 * Использует команду конфигуратора /DumpConfigToFiles с параметрами -AllExtensions и -update
+	 * Выгружает выбранное расширение командой /DumpConfigToFiles -Extension с параметром -update
 	 * для автоматической выгрузки только измененных файлов всех расширений из конфигурации 1С
 	 * в отдельные каталоги. Каждое расширение выгружается в каталог со своим именем в папке src/cfe.
 	 * 
@@ -512,7 +600,7 @@ export class ExtensionsCommands extends BaseCommand {
 	/**
 	 * Выгружает обновление расширений из информационной базы в исходники
 	 * 
-	 * Использует команду конфигуратора /DumpConfigToFiles с параметрами -AllExtensions и -update
+	 * Выгружает выбранное расширение командой /DumpConfigToFiles -Extension с параметром -update
 	 * для автоматической выгрузки только измененных файлов всех расширений из конфигурации 1С
 	 * в отдельные каталоги. Каждое расширение выгружается в каталог со своим именем в папке src/cfe.
 	 * 
@@ -526,12 +614,17 @@ export class ExtensionsCommands extends BaseCommand {
 
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getDumpUpdateExtensionToSrcCommandName();
+
+		const extensionName = await this.resolveExtensionNameForDump(workspaceRoot, commandName.title);
+		if (!extensionName) {
+			return;
+		}
+
 		const cfePath = this.vrunner.getCfePath();
-		
-		// Формируем абсолютный путь к каталогу выгрузки
-		const absoluteCfePath = path.isAbsolute(cfePath) 
-			? cfePath 
+		const absoluteCfeRoot = path.isAbsolute(cfePath)
+			? cfePath
 			: path.join(workspaceRoot, cfePath);
+		const absoluteCfePath = path.join(absoluteCfeRoot, extensionName);
 		
 		// Путь к универсальному CLI скрипту v8runner
 		const scriptPath = path.join(workspaceRoot, 'oscript_modules', 'v8runner', 'src', 'v8runner-cli.os');
@@ -546,12 +639,18 @@ export class ExtensionsCommands extends BaseCommand {
 			);
 			return;
 		}
+
+		try {
+			await fs.mkdir(absoluteCfePath, { recursive: true });
+		} catch (error) {
+			vscode.window.showErrorMessage(`Ошибка при создании папки ${absoluteCfePath}: ${(error as Error).message}`);
+			return;
+		}
 		
 		// Получаем путь к oscript
 		const onescriptPath = this.vrunner.getOnescriptPath();
 		
 		// Аргументы для универсального CLI с абсолютными путями
-		// Используем dumpExtensionToFiles с -AllExtensions для выгрузки всех расширений в отдельные каталоги
 		const args = [
 			scriptPath,
 			'dumpExtensionToFiles',
@@ -559,7 +658,7 @@ export class ExtensionsCommands extends BaseCommand {
 			'--db-user', ibParams.username,
 			'--db-pwd', ibParams.password,
 			'--out', absoluteCfePath,
-			'--extension', '-AllExtensions',
+			'--extension', extensionName,
 			'--update'
 		];
 		
@@ -620,8 +719,8 @@ export class ExtensionsCommands extends BaseCommand {
 			return;
 		}
 
-		const extensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
-		if (!extensionFolders) {
+		const allExtensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
+		if (!allExtensionFolders) {
 			return;
 		}
 
@@ -637,6 +736,12 @@ export class ExtensionsCommands extends BaseCommand {
 		
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getUpdateExtensionFromSrcWithCommitCommandName();
+
+		const selectedExtension = await this.pickOne(allExtensionFolders, 'Выберите расширение', commandName.title);
+		if (!selectedExtension) {
+			return;
+		}
+		const extensionFolders = [selectedExtension];
 
 		// Путь к универсальному CLI скрипту v8runner
 		const scriptPath = path.join(workspaceRoot, 'oscript_modules', 'v8runner', 'src', 'v8runner-cli.os');
@@ -826,14 +931,20 @@ export class ExtensionsCommands extends BaseCommand {
 			return;
 		}
 
-		const extensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
-		if (!extensionFolders) {
+		const allExtensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
+		if (!allExtensionFolders) {
 			return;
 		}
 
 		const buildPath = this.vrunner.getBuildPath();
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getDumpExtensionToCfeCommandName();
+
+		const selectedExtension = await this.pickOne(allExtensionFolders, 'Выберите расширение', commandName.title);
+		if (!selectedExtension) {
+			return;
+		}
+		const extensionFolders = [selectedExtension];
 
 		// Путь к универсальному CLI скрипту v8runner
 		const scriptPath = path.join(workspaceRoot, 'oscript_modules', 'v8runner', 'src', 'v8runner-cli.os');
@@ -961,14 +1072,20 @@ export class ExtensionsCommands extends BaseCommand {
 			return;
 		}
 
-		const extensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
-		if (!extensionFolders) {
+		const allExtensionFolders = await this.getExtensionFoldersFromSrc(workspaceRoot);
+		if (!allExtensionFolders) {
 			return;
 		}
 
 		const buildPath = this.vrunner.getBuildPath();
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getBuildExtensionCommandName();
+
+		const selectedExtension = await this.pickOne(allExtensionFolders, 'Выберите расширение', commandName.title);
+		if (!selectedExtension) {
+			return;
+		}
+		const extensionFolders = [selectedExtension];
 		const cfePath = this.vrunner.getCfePath();
 
 		// Путь к универсальному CLI скрипту v8runner
@@ -1100,14 +1217,20 @@ export class ExtensionsCommands extends BaseCommand {
 			return;
 		}
 
-		const cfeFiles = await this.getFilesByExtension(cfeBuildPath, '.cfe', `Ошибка при чтении папки ${buildPath}/cfe`);
-		if (cfeFiles.length === 0) {
+		const allCfeFiles = await this.getFilesByExtension(cfeBuildPath, '.cfe', `Ошибка при чтении папки ${buildPath}/cfe`);
+		if (allCfeFiles.length === 0) {
 			vscode.window.showInformationMessage(`В папке ${buildPath}/cfe не найдено файлов .cfe`);
 			return;
 		}
 
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getDecompileExtensionCommandName();
+
+		const selectedCfeFile = await this.pickOne(allCfeFiles, 'Выберите расширение', commandName.title);
+		if (!selectedCfeFile) {
+			return;
+		}
+		const cfeFiles = [selectedCfeFile];
 		const cfePath = this.vrunner.getCfePath();
 
 		// Путь к универсальному CLI скрипту v8runner
