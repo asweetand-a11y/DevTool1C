@@ -4,6 +4,8 @@
  */
 
 import * as vscode from 'vscode';
+import { buildDebugTree, escapeHtml, type DebugTreeNode } from '../webview/debugTree';
+import { getWebviewPanelOptions, wrapWebviewHtml } from '../webview/webviewAssets';
 
 interface DebugVariable {
 	name: string;
@@ -65,7 +67,6 @@ async function evaluateExpression(
 	const res = evalResult as { result?: string; variablesReference?: number; type?: string };
 	const typeName = res.type ?? '';
 
-	// Коллекции — 1c/evaluateCollection для строк/элементов (ТаблицаЗначений, Структура и т.д.)
 	if (isCollectionType(typeName)) {
 		const useEnum = /Структура|Соответствие/i.test(typeName);
 		const collExpr =
@@ -96,7 +97,6 @@ async function evaluateExpression(
 		}
 	}
 
-	// Объекты с дочерними свойствами — fetchVariableTree
 	if (res.variablesReference && res.variablesReference > 0) {
 		const rows = await fetchVariableTree(session, res.variablesReference, expression);
 		return rows.map((r) => ({ name: r.path, value: r.value, type: r.type }));
@@ -105,190 +105,137 @@ async function evaluateExpression(
 	return [{ name: expression, value: res.result ?? '', type: typeName }];
 }
 
-function escapeHtml(s: string): string {
-	return s
-		.replace(/&/g, '&amp;')
-		.replace(/</g, '&lt;')
-		.replace(/>/g, '&gt;')
-		.replace(/"/g, '&quot;');
-}
-
-interface TreeNode {
-	key: string;
-	name: string;
-	value: string;
-	type: string;
-	children: TreeNode[];
-}
-
-/** Строит дерево из плоского списка путей. */
-function buildTree(rows: Array<{ name: string; value: string; type: string }>, rootExpression: string): TreeNode {
-	const byPath = new Map<string, TreeNode>();
-	const root: TreeNode = { key: rootExpression, name: rootExpression, value: '', type: '', children: [] };
-	byPath.set(rootExpression, root);
-
-	// Сортировка: более короткие пути первыми
-	const sorted = [...rows].sort((a, b) => a.name.length - b.name.length);
-
-	for (const r of sorted) {
-		const path = r.name;
-		const segments = path.split('.');
-		const displayName = segments.pop() ?? path;
-		const parentPath = segments.join('.');
-
-		const node: TreeNode = {
-			key: path,
-			name: displayName,
-			value: r.value,
-			type: r.type,
-			children: [],
-		};
-		byPath.set(path, node);
-
-		const parent = parentPath ? byPath.get(parentPath) : root;
-		if (parent) {
-			parent.children.push(node);
-		} else {
-			root.children.push(node);
-		}
-	}
-
-	return root;
-}
-
-function renderTreeHtml(node: TreeNode, depth: number): string {
-	const hasChildren = node.children.length > 0;
-	const indent = depth * 16;
-	const valueType = [node.value, node.type].filter(Boolean).join('  ');
-	const toggle = hasChildren
-		? `<span class="toggle" role="button" tabindex="0" aria-expanded="false">▶</span>`
-		: '<span class="no-toggle"></span>';
-
-	const childrenHtml = hasChildren
-		? `<div class="tree-children collapsed">${node.children.map((c) => renderTreeHtml(c, depth + 1)).join('')}</div>`
-		: '';
-
-	return `
-		<div class="tree-node" data-key="${escapeHtml(node.key)}">
-			<div class="tree-row" style="padding-left: ${indent}px">
-				${toggle}
-				<span class="name">${escapeHtml(node.name)}</span>
-				${valueType ? `<span class="value-type">${escapeHtml(valueType)}</span>` : ''}
-			</div>
-			${childrenHtml}
-		</div>`;
-}
-
-function buildResultHtml(rows: Array<{ name: string; value: string; type: string }>, expression: string): string {
-	// Проверяем, есть ли иерархия (пути с точкой)
+function buildResultPayload(
+	rows: Array<{ name: string; value: string; type: string }>,
+	expression: string,
+): { kind: 'table'; count: number; rows: Array<{ name: string; value: string; type: string }> } | { kind: 'tree'; count: number; nodes: DebugTreeNode[] } {
 	const hasHierarchy = rows.some((r) => r.name.includes('.'));
 	if (!hasHierarchy || rows.length <= 1) {
-		// Плоский вывод для коллекций и примитивов
-		const rowsHtml = rows
-			.map((r) => `<tr><td>${escapeHtml(r.name)}</td><td>${escapeHtml(r.value)}</td><td>${escapeHtml(r.type)}</td></tr>`)
-			.join('');
-		return `
-		<div class="result-section">
-			<div class="count">Элементов: ${rows.length}</div>
-			<table>
-				<thead><tr><th>Свойство</th><th>Значение</th><th>Тип</th></tr></thead>
-				<tbody>${rowsHtml}</tbody>
-			</table>
-		</div>`;
+		return { kind: 'table', count: rows.length, rows };
 	}
-
-	const tree = buildTree(rows, expression);
-	const treeHtml =
-		tree.children.length > 0
-			? tree.children.map((c) => renderTreeHtml(c, 0)).join('')
-			: `<div class="tree-row"><span class="no-toggle"></span><span class="name">${escapeHtml(expression)}</span><span class="value-type">(пусто)</span></div>`;
-
-	return `
-	<div class="result-section tree-view">
-		<div class="count">Элементов: ${rows.length}</div>
-		<div class="tree-container" id="treeRoot">${treeHtml}</div>
-	</div>`;
+	const tree = buildDebugTree(rows, expression);
+	return { kind: 'tree', count: rows.length, nodes: tree.children };
 }
 
-function getPanelHtml(expression: string, resultHtml: string | null, error?: string): string {
-	const resultOrError = error
-		? `<div class="error">${escapeHtml(error)}</div>`
-		: resultHtml ?? '';
-	return `<!DOCTYPE html>
-<html>
-<head>
-	<meta charset="UTF-8">
-	<style>
-		body { font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); padding: 12px; color: var(--vscode-foreground); background-color: var(--vscode-editor-background); }
-		.input-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
-		label { font-weight: 500; white-space: nowrap; color: var(--vscode-foreground); }
-		input { flex: 1; padding: 6px 10px; font-family: var(--vscode-font-family); font-size: var(--vscode-font-size); color: var(--vscode-input-foreground); background-color: var(--vscode-input-background); border: 1px solid var(--vscode-input-border); }
-		button { padding: 6px 16px; cursor: pointer; font-family: inherit; font-size: inherit; color: var(--vscode-button-foreground); background-color: var(--vscode-button-background); border: none; }
-		button:hover { background-color: var(--vscode-button-hoverBackground); }
-		button:disabled { opacity: 0.6; cursor: not-allowed; }
-		table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-		th, td { border: 1px solid var(--vscode-panel-border); padding: 6px 10px; text-align: left; }
-		th { background: var(--vscode-editor-inactiveSelectionBackground); }
-		tr:nth-child(even) { background: var(--vscode-editor-inactiveSelectionBackground); opacity: 0.5; }
-		.result-section { margin-top: 12px; }
-		.count { color: var(--vscode-descriptionForeground); font-size: 12px; margin-bottom: 8px; }
-		.error { color: var(--vscode-errorForeground); margin-top: 12px; }
-		.hint { color: var(--vscode-descriptionForeground); margin-top: 12px; }
-		h2 { margin-top: 0; margin-bottom: 12px; font-size: var(--vscode-font-size); font-weight: 600; color: var(--vscode-foreground); }
-		.tree-view .tree-container { font-family: var(--vscode-editor-font-family); }
-		.tree-view .tree-node { display: block; }
-		.tree-view .tree-row { display: flex; align-items: baseline; gap: 8px; padding: 2px 0; line-height: 1.4; }
-		.tree-view .tree-row:hover { background: var(--vscode-list-hoverBackground); }
-		.tree-view .toggle { cursor: pointer; width: 16px; flex-shrink: 0; user-select: none; font-size: 10px; }
-		.tree-view .no-toggle { width: 16px; flex-shrink: 0; display: inline-block; }
-		.tree-view .name { flex-shrink: 0; font-weight: 500; }
-		.tree-view .value-type { color: var(--vscode-descriptionForeground); word-break: break-all; }
-		.tree-view .tree-children { margin-left: 4px; }
-		.tree-view .tree-children.collapsed { display: none; }
-	</style>
-</head>
-<body>
+function getPanelHtml(webview: vscode.Webview, expression: string): string {
+	const body = `
 	<h2>Рассчитать значение</h2>
 	<div class="input-row">
-		<label for="expr">Выражение:</label>
-		<input type="text" id="expr" value="${escapeHtml(expression)}" />
-		<button id="calc">Рассчитать</button>
+		<vscode-label for="expr">Выражение:</vscode-label>
+		<vscode-textfield id="expr" value="${escapeHtml(expression)}"></vscode-textfield>
+		<vscode-button id="calc">Рассчитать</vscode-button>
 	</div>
-	<div class="result-area">${resultOrError}</div>
-	<script>
+	<div class="result-area" id="resultArea"></div>`;
+
+	const extraScript = `
 		const vscode = acquireVsCodeApi();
 		const exprInput = document.getElementById('expr');
 		const calcBtn = document.getElementById('calc');
-		const resultArea = document.querySelector('.result-area');
-		calcBtn.addEventListener('click', () => {
-			const expr = exprInput.value.trim();
+		const resultArea = document.getElementById('resultArea');
+
+		function runCalc() {
+			const expr = (exprInput.value || '').trim();
 			if (!expr) return;
 			calcBtn.disabled = true;
-			resultArea.innerHTML = '<div class="hint">Вычисление…</div>';
+			resultArea.replaceChildren();
+			const hint = document.createElement('div');
+			hint.className = 'hint';
+			hint.textContent = 'Вычисление…';
+			resultArea.appendChild(hint);
 			vscode.postMessage({ command: 'calculate', expression: expr });
+		}
+
+		function appendCount(parent, count) {
+			const el = document.createElement('div');
+			el.className = 'count';
+			el.textContent = 'Элементов: ' + count;
+			parent.appendChild(el);
+		}
+
+		function renderTable(rows) {
+			const table = document.createElement('vscode-table');
+			table.setAttribute('zebra', '');
+			table.setAttribute('bordered', '');
+			const header = document.createElement('vscode-table-header');
+			header.slot = 'header';
+			for (const h of ['Свойство', 'Значение', 'Тип']) {
+				const cell = document.createElement('vscode-table-header-cell');
+				cell.textContent = h;
+				header.appendChild(cell);
+			}
+			const body = document.createElement('vscode-table-body');
+			body.slot = 'body';
+			for (const r of rows) {
+				const tr = document.createElement('vscode-table-row');
+				for (const text of [r.name, r.value, r.type]) {
+					const td = document.createElement('vscode-table-cell');
+					td.textContent = text;
+					tr.appendChild(td);
+				}
+				body.appendChild(tr);
+			}
+			table.appendChild(header);
+			table.appendChild(body);
+			return table;
+		}
+
+		function appendTreeItems(parent, nodes) {
+			for (const node of nodes) {
+				const item = document.createElement('vscode-tree-item');
+				if (node.children && node.children.length) {
+					item.setAttribute('branch', '');
+				}
+				item.appendChild(document.createTextNode(node.name));
+				const decoration = [node.value, node.type].filter(Boolean).join('  ');
+				if (decoration) {
+					const span = document.createElement('span');
+					span.slot = 'decoration';
+					span.textContent = decoration;
+					item.appendChild(span);
+				}
+				if (node.children && node.children.length) {
+					appendTreeItems(item, node.children);
+				}
+				parent.appendChild(item);
+			}
+		}
+
+		calcBtn.addEventListener('click', runCalc);
+		exprInput.addEventListener('keydown', (e) => {
+			if (e.key === 'Enter') runCalc();
 		});
+
 		window.addEventListener('message', (e) => {
 			const msg = e.data;
-			if (msg.type === 'result') {
-				resultArea.innerHTML = msg.html;
-			} else if (msg.type === 'error') {
-				resultArea.innerHTML = '<div class="error">' + (msg.message || 'Ошибка') + '</div>';
+			resultArea.replaceChildren();
+			if (msg.type === 'error') {
+				const err = document.createElement('div');
+				err.className = 'error';
+				err.textContent = msg.message || 'Ошибка';
+				resultArea.appendChild(err);
+			} else if (msg.type === 'result') {
+				appendCount(resultArea, msg.count);
+				if (msg.kind === 'table') {
+					resultArea.appendChild(renderTable(msg.rows || []));
+				} else if (msg.kind === 'tree') {
+					const tree = document.createElement('vscode-tree');
+					tree.setAttribute('indent-guides', 'onHover');
+					const nodes = msg.nodes || [];
+					if (nodes.length === 0) {
+						const item = document.createElement('vscode-tree-item');
+						item.textContent = '(пусто)';
+						tree.appendChild(item);
+					} else {
+						appendTreeItems(tree, nodes);
+					}
+					resultArea.appendChild(tree);
+				}
 			}
 			calcBtn.disabled = false;
 		});
-		resultArea.addEventListener('click', (e) => {
-			const btn = e.target.closest && e.target.closest('.toggle');
-			if (!btn) return;
-			const node = btn.closest('.tree-node');
-			const children = node && node.querySelector(':scope > .tree-children');
-			if (!children) return;
-			const collapsed = children.classList.toggle('collapsed');
-			btn.textContent = collapsed ? '▶' : '▼';
-			btn.setAttribute('aria-expanded', collapsed ? 'false' : 'true');
-		});
-	</script>
-</body>
-</html>`;
+	`;
+
+	return wrapWebviewHtml(webview, body, '', extraScript);
 }
 
 let currentPanel: vscode.WebviewPanel | undefined;
@@ -311,22 +258,24 @@ export function openCalculateExpressionPanel(): void {
 		'1cCalculateExpression',
 		'Рассчитать значение',
 		column,
-		{ enableScripts: true },
+		getWebviewPanelOptions(),
 	);
 
 	currentPanel = panel;
 	let lastExpression = '';
 
-	panel.webview.html = getPanelHtml(lastExpression, null);
+	panel.webview.html = getPanelHtml(panel.webview, lastExpression);
 
 	panel.webview.onDidReceiveMessage(async (msg) => {
-		if (msg.command !== 'calculate' || !msg.expression?.trim()) return;
+		if (msg.command !== 'calculate' || !msg.expression?.trim()) {
+			return;
+		}
 		const expression = String(msg.expression).trim();
 		lastExpression = expression;
 		try {
 			const rows = await evaluateExpression(session, expression);
-			const html = buildResultHtml(rows, expression);
-			panel.webview.postMessage({ type: 'result', html });
+			const payload = buildResultPayload(rows, expression);
+			panel.webview.postMessage({ type: 'result', ...payload });
 		} catch (err) {
 			const msg2 = err instanceof Error ? err.message : String(err);
 			panel.webview.postMessage({ type: 'error', message: msg2 });

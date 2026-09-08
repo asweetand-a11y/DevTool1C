@@ -2,6 +2,7 @@
 build/
 out/
 dist/
+media/webview/
 node_modules/
 AGENTS.md
 .cache-bsl/

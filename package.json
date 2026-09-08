@@ -2,7 +2,7 @@
   "name": "1c-dev-tools",
   "displayName": "1C Dev Tools",
   "description": "Расширение для Cursor с инструментами разработки для экосистемы 1С. Предоставляет удобный интерфейс для работы с проектами 1С, включая разбор обработок, отчетов и конфигураций.",
-  "version": "2.10.5",
+  "version": "2.10.6",
   "publisher": "whiterabbit",
   "repository": {
     "type": "git",
@@ -681,20 +681,37 @@
         },
         "1c-dev-tools.debug.timings.immediatePingDelaysMs": {
           "type": "array",
-          "items": { "type": "number" },
-          "default": [25, 50, 100],
+          "items": {
+            "type": "number"
+          },
+          "default": [
+            25,
+            50,
+            100
+          ],
           "description": "Интервалы немедленного ping после F11/Shift+F11 для вылова callStackFormed (мс). Первый 25 вместо 50 — быстрее."
         },
         "1c-dev-tools.debug.timings.evalExprRetryDelaysMs": {
           "type": "array",
-          "items": { "type": "number" },
-          "default": [50, 100],
+          "items": {
+            "type": "number"
+          },
+          "default": [
+            50,
+            100
+          ],
           "description": "Задержки retry evalExpr при пустом ответе (мс)."
         },
         "1c-dev-tools.debug.timings.variablesRequestRetryDelaysMs": {
           "type": "array",
-          "items": { "type": "number" },
-          "default": [50, 100, 150],
+          "items": {
+            "type": "number"
+          },
+          "default": [
+            50,
+            100,
+            150
+          ],
           "description": "Задержки retry variablesRequest (evalLocalVariables) при пустом ответе (мс). Устраняет появление переменных «через раз»."
         },
         "1c-dev-tools.debug.timings.pingDbgtgtIntervalMs": {
@@ -736,20 +753,22 @@
     "package": "vsce package"
   },
   "dependencies": {
+    "@vscode-elements/elements": "^2.5.1",
+    "@vscode/codicons": "^0.0.45",
     "@vscode/debugadapter": "^1.68.0",
     "@vscode/debugprotocol": "^1.68.0",
     "fast-xml-parser": "^4.5.0",
     "iconv-lite": "^0.7.2"
   },
   "devDependencies": {
-    "esbuild": "^0.24.0",
-    "npm-run-all": "^4.1.5",
     "@types/node": "22.x",
     "@types/vscode": "^1.60.0",
     "@vscode/test-cli": "^0.0.12",
     "@vscode/test-electron": "^2.5.2",
     "@vscode/vsce": "^3.7.1",
+    "esbuild": "^0.24.0",
     "eslint": "^9.39.1",
+    "npm-run-all": "^4.1.5",
     "typescript": "^5.9.3",
     "typescript-eslint": "^8.48.1"
   }

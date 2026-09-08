@@ -3,6 +3,7 @@
  */
 
 import * as vscode from 'vscode';
+import { getWebviewPanelOptions, wrapWebviewHtml } from '../webview/webviewAssets';
 
 /** Строка цели с сервера (customRequest onec.getDebugTargets). */
 export interface PickerTargetRow {
@@ -17,51 +18,38 @@ export interface PickerTargetRow {
 let currentPanel: vscode.WebviewPanel | undefined;
 let boundSession: vscode.DebugSession | undefined;
 
-function getPickerHtml(): string {
-	return `<!DOCTYPE html>
-<html lang="ru">
-<head>
-	<meta charset="UTF-8">
-	<meta name="viewport" content="width=device-width, initial-scale=1.0">
-	<style>
-		body { font-family: var(--vscode-font-family); font-size: 13px; padding: 10px; color: var(--vscode-foreground); }
-		h3 { margin: 12px 0 6px 0; font-size: 13px; font-weight: 600; }
-		.toolbar { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; align-items: center; }
-		button { padding: 4px 10px; cursor: pointer; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; border-radius: 2px; }
-		button:disabled { opacity: 0.45; cursor: not-allowed; }
-		button.secondary { background: var(--vscode-button-secondaryBackground); color: var(--vscode-button-secondaryForeground); }
-		table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
-		th, td { border: 1px solid var(--vscode-panel-border); padding: 4px 8px; text-align: left; }
-		th { background: var(--vscode-editor-inactiveSelectionBackground); }
-		tr.selected { background: var(--vscode-list-activeSelectionBackground); color: var(--vscode-list-activeSelectionForeground); }
-		tr:hover { background: var(--vscode-list-hoverBackground); }
-		.status { font-size: 12px; color: var(--vscode-descriptionForeground); min-height: 1.2em; }
-		.err { color: var(--vscode-errorForeground); }
-	</style>
-</head>
-<body>
+function getPickerHtml(webview: vscode.Webview): string {
+	const body = `
 	<div class="toolbar">
-		<button type="button" id="btnRefresh">Обновить</button>
-		<button type="button" id="btnConnect" class="secondary">Подключить</button>
-		<span style="flex:1"></span>
+		<vscode-button id="btnRefresh">Обновить</vscode-button>
+		<vscode-button id="btnConnect" secondary>Подключить</vscode-button>
 	</div>
 	<h3>Доступные предметы отладки</h3>
-	<table>
-		<thead><tr><th>Пользователь</th><th>Тип</th><th>Сеанс</th></tr></thead>
-		<tbody id="tblAvail"></tbody>
-	</table>
+	<vscode-table zebra bordered>
+		<vscode-table-header slot="header">
+			<vscode-table-header-cell>Пользователь</vscode-table-header-cell>
+			<vscode-table-header-cell>Тип</vscode-table-header-cell>
+			<vscode-table-header-cell>Сеанс</vscode-table-header-cell>
+		</vscode-table-header>
+		<vscode-table-body slot="body" id="tblAvail"></vscode-table-body>
+	</vscode-table>
 	<h3>Подключенные предметы отладки</h3>
 	<div class="toolbar">
-		<button type="button" id="btnDisconnect" class="secondary">Отключить</button>
-		<button type="button" id="btnSuspend" class="secondary">Остановить</button>
-		<button type="button" id="btnTerminate" class="secondary">Завершить</button>
+		<vscode-button id="btnDisconnect" secondary>Отключить</vscode-button>
+		<vscode-button id="btnSuspend" secondary>Остановить</vscode-button>
+		<vscode-button id="btnTerminate" secondary>Завершить</vscode-button>
 	</div>
-	<table>
-		<thead><tr><th>Пользователь</th><th>Тип</th><th>Сеанс</th></tr></thead>
-		<tbody id="tblConn"></tbody>
-	</table>
-	<div class="status" id="status"></div>
-	<script>
+	<vscode-table zebra bordered>
+		<vscode-table-header slot="header">
+			<vscode-table-header-cell>Пользователь</vscode-table-header-cell>
+			<vscode-table-header-cell>Тип</vscode-table-header-cell>
+			<vscode-table-header-cell>Сеанс</vscode-table-header-cell>
+		</vscode-table-header>
+		<vscode-table-body slot="body" id="tblConn"></vscode-table-body>
+	</vscode-table>
+	<div class="status" id="status"></div>`;
+
+	const extraScript = `
 		const vscode = acquireVsCodeApi();
 		let selectedAvailId = '';
 		let selectedConnId = '';
@@ -72,19 +60,34 @@ function getPickerHtml(): string {
 			return '—';
 		}
 
+		function clearSelection() {
+			document.querySelectorAll('#tblAvail vscode-table-row, #tblConn vscode-table-row').forEach((r) => r.classList.remove('selected'));
+		}
+
 		function renderRows(tbodyId, rows, which) {
 			const tb = document.getElementById(tbodyId);
-			tb.innerHTML = '';
+			tb.replaceChildren();
 			if (!rows || rows.length === 0) {
-				tb.innerHTML = '<tr><td colspan="3">(пусто)</td></tr>';
+				const empty = document.createElement('vscode-table-row');
+				const cell = document.createElement('vscode-table-cell');
+				cell.textContent = '(пусто)';
+				empty.appendChild(cell);
+				empty.appendChild(document.createElement('vscode-table-cell'));
+				empty.appendChild(document.createElement('vscode-table-cell'));
+				tb.appendChild(empty);
 				return;
 			}
 			for (const row of rows) {
-				const tr = document.createElement('tr');
+				const tr = document.createElement('vscode-table-row');
 				tr.dataset.id = row.id;
 				const pick = which === 'avail' ? selectedAvailId : selectedConnId;
 				if (row.id === pick) tr.classList.add('selected');
-				tr.innerHTML = '<td>' + escapeHtml(row.userName || '') + '</td><td>' + escapeHtml(row.typeDisplay || row.targetType || '') + '</td><td>' + escapeHtml(seanceCell(row)) + '</td>';
+				const cells = [row.userName || '', row.typeDisplay || row.targetType || '', seanceCell(row)];
+				for (const text of cells) {
+					const td = document.createElement('vscode-table-cell');
+					td.textContent = text;
+					tr.appendChild(td);
+				}
 				tr.addEventListener('click', () => {
 					if (which === 'avail') {
 						selectedAvailId = row.id;
@@ -93,15 +96,11 @@ function getPickerHtml(): string {
 						selectedConnId = row.id;
 						selectedAvailId = '';
 					}
-					document.querySelectorAll('#tblAvail tr, #tblConn tr').forEach((r) => r.classList.remove('selected'));
+					clearSelection();
 					tr.classList.add('selected');
 				});
 				tb.appendChild(tr);
 			}
-		}
-
-		function escapeHtml(s) {
-			return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 		}
 
 		window.addEventListener('message', (event) => {
@@ -112,10 +111,10 @@ function getPickerHtml(): string {
 				const st = document.getElementById('status');
 				st.textContent = msg.status || '';
 				st.className = 'status' + (msg.error ? ' err' : '');
-				document.querySelectorAll('#tblAvail tr').forEach((tr) => {
+				document.querySelectorAll('#tblAvail vscode-table-row').forEach((tr) => {
 					if (tr.dataset.id === selectedAvailId) tr.classList.add('selected');
 				});
-				document.querySelectorAll('#tblConn tr').forEach((tr) => {
+				document.querySelectorAll('#tblConn vscode-table-row').forEach((tr) => {
 					if (tr.dataset.id === selectedConnId) tr.classList.add('selected');
 				});
 			}
@@ -142,9 +141,9 @@ function getPickerHtml(): string {
 		});
 
 		vscode.postMessage({ type: 'ready' });
-	</script>
-</body>
-</html>`;
+	`;
+
+	return wrapWebviewHtml(webview, body, '', extraScript);
 }
 
 /** VS Code отдаёт либо тело ответа, либо объект с полем body — нормализуем. */
@@ -212,7 +211,7 @@ export function showDebugTargetsPicker(_context: vscode.ExtensionContext, sessio
 		'onecDebugTargetsPicker',
 		'Предметы отладки (1С)',
 		vscode.ViewColumn.Beside,
-		{ enableScripts: true, retainContextWhenHidden: true },
+		getWebviewPanelOptions(true),
 	);
 	currentPanel = panel;
 
@@ -221,7 +220,7 @@ export function showDebugTargetsPicker(_context: vscode.ExtensionContext, sessio
 		boundSession = undefined;
 	});
 
-	panel.webview.html = getPickerHtml();
+	panel.webview.html = getPickerHtml(panel.webview);
 
 	panel.webview.onDidReceiveMessage(
 		async (msg: { type?: string; id?: string }) => {
@@ -232,7 +231,6 @@ export function showDebugTargetsPicker(_context: vscode.ExtensionContext, sessio
 			}
 			const active = vscode.debug.activeDebugSession;
 			if (active && active.id !== sess.id) {
-				// Панель могла остаться от старой сессии — перепривязать
 				boundSession = active.type === 'onec' && active.configuration?.request === 'attach' ? active : sess;
 			}
 			const s = boundSession!;

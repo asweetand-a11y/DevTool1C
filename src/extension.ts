@@ -16,6 +16,7 @@ import { registerDebugAdapter } from './debug/debugAdapter';
 import { showVariableInWindow } from './debug/showVariableInWindow';
 import { openCalculateExpressionPanel } from './debug/calculateExpression';
 import { showDebugTargetsPicker } from './debug/debugTargetsPickerPanel';
+import { initWebviewAssets } from './webview/webviewAssets';
 
 /**
  * Проверяет, является ли открытая рабочая область проектом 1С
@@ -47,6 +48,7 @@ async function is1CProject(): Promise<boolean> {
  * @param context - Контекст расширения VS Code
  */
 export async function activate(context: vscode.ExtensionContext) {
+	initWebviewAssets(context);
 	await vscode.commands.executeCommand('setContext', '1c-dev-tools.is1CProject', false);
 
 	const isProject = await is1CProject();
