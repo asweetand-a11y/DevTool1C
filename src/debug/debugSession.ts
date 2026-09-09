@@ -36,6 +36,7 @@ import {
 	getModulePathByObjectProperty,
 } from './metadataProvider';
 import { getDebugTimingConfig } from './debugTimingConfig';
+import { clearAgentDebugSnapshot, publishAgentDebugSnapshot } from './agentDebugSnapshot';
 import { RdbgClient } from './rdbgClient';
 import {
 	AttachDebugUiResult,
@@ -794,6 +795,12 @@ export class OnecDebugSession extends DebugSession {
 				const stackChanged = stack.length > 0 && !this.isCallStackEqual(current, stack);
 				if (stackChanged) {
 					this.threadsCallStack.set(threadId, stack);
+					publishAgentDebugSnapshot({
+						attached: this.attached,
+						rootProject: this.rootProject,
+						targets: this.targets,
+						stacks: this.threadsCallStack,
+					});
 					// Не очищаем evalExprCache — при InvalidatedEvent возвращаем кэш, пока сервер не ответит. Иначе переменные «обнуляются» при быстром F11.
 					const stoppedEv = new StoppedEvent('step', threadId);
 					this.sendEvent(stoppedEv);
@@ -881,6 +888,12 @@ export class OnecDebugSession extends DebugSession {
 		}
 		const stackOrdered = csf.callStack;
 		this.threadsCallStack.set(threadId, stackOrdered);
+		publishAgentDebugSnapshot({
+			attached: this.attached,
+			rootProject: this.rootProject,
+			targets: this.targets,
+			stacks: this.threadsCallStack,
+		});
 		// Не очищаем evalExprCache на step — иначе Watch показывает «Неопределено» пока сервер не ответит на evalExpr.
 		const stoppedEv = new StoppedEvent(csf.reason, threadId);
 		this.sendEvent(stoppedEv);
@@ -1557,6 +1570,7 @@ export class OnecDebugSession extends DebugSession {
 	): Promise<void> {
 		this.stopPingPolling();
 		this.clearEvalExprCache();
+		clearAgentDebugSnapshot();
 		this.targets = [];
 		this.rteProcVersionByTargetId.clear();
 		this.lastPingDbgtgtByTargetId.clear();

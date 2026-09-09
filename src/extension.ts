@@ -13,6 +13,8 @@ import { RunCommands } from './commands/runCommands';
 import { TestCommands } from './commands/testCommands';
 import { WorkspaceTasksCommands } from './commands/workspaceTasksCommands';
 import { registerDebugAdapter } from './debug/debugAdapter';
+import { startAgentDebugMcp } from './debug/agentDebugMcp';
+import { getAgentDebugSnapshot, getAgentDebugSnapshotFile } from './debug/agentDebugSnapshot';
 import { showVariableInWindow } from './debug/showVariableInWindow';
 import { openCalculateExpressionPanel } from './debug/calculateExpression';
 import { showDebugTargetsPicker } from './debug/debugTargetsPickerPanel';
@@ -58,6 +60,7 @@ export async function activate(context: vscode.ExtensionContext) {
 	}
 
 	registerDebugAdapter(context);
+	startAgentDebugMcp(context);
 
 	const debugTargetsPickerOnStart = vscode.debug.onDidStartDebugSession((session) => {
 		if (session.type === 'onec' && session.configuration?.request === 'attach') {
@@ -74,6 +77,16 @@ export async function activate(context: vscode.ExtensionContext) {
 			} else {
 				void vscode.window.showWarningMessage('Активна не сессия отладки 1С с request: attach.');
 			}
+		},
+	);
+	const copyDebugSnapshotCommand = vscode.commands.registerCommand(
+		'1c-dev-tools.debug.copyAgentSnapshot',
+		async () => {
+			const snap = getAgentDebugSnapshot();
+			const file = getAgentDebugSnapshotFile();
+			const text = snap ? JSON.stringify(snap, null, 2) : `Нет снимка. Остановитесь на точке BSL.\nФайл: ${file}`;
+			await vscode.env.clipboard.writeText(text);
+			void vscode.window.showInformationMessage(snap ? 'Стек отладки скопирован в буфер (для агента).' : `Снимка нет. Путь файла: ${file}`);
 		},
 	);
 
@@ -436,6 +449,7 @@ export async function activate(context: vscode.ExtensionContext) {
 		calculateExpressionFromEditorCommand,
 		debugTargetsPickerOnStart,
 		showDebugTargetsPickerCommand,
+		copyDebugSnapshotCommand,
 	);
 
 }

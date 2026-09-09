@@ -470,6 +470,166 @@ function parsePingDataBinary(buffer: Buffer): {
 	return result;
 }
 
+/**
+ * Фиксированные propertyID типов модулей BSL (зашиты в платформе 1С, не зависят от конфигурации).
+ * Это не UUID документа/справочника из XML. UUID объекта (objectID) в бинарном moduleIDStr
+ * лежит рядом и извлекается как соседний GUID — он как раз бывает любой.
+ * Набор нужен только как «якорь»: любой 16-байтовый кусок можно прочитать как UUID,
+ * поэтому без фильтра по известным типам модулей получим ложные срабатывания.
+ */
+const KNOWN_BSL_PROPERTY_IDS = new Set([
+	'a637f77f-3840-441d-a1c3-699c8c5cb7e0', // ObjectModule
+	'd1b64a2c-8078-4982-8190-8f81aefda192', // ManagerModule
+	'32e087ab-1491-49b6-aba7-43571b41ac2b', // Form / Module.bsl
+	'd5963243-262e-4398-b4d7-fb16d06484f6', // CommonModule / Web / HTTP
+	'078a6af8-d22c-4248-9c33-7e90075a3d2c', // CommandModule
+	'9f36fd70-4bf4-47f6-b235-935f73aab43f', // RecordSetModule
+	'3e58c91f-9aaa-4f42-8999-4baf33907b75', // ValueManagerModule
+	'd22e852a-cf8a-4f77-8ccb-3548e7792bea', // ManagedApplicationModule
+	'9b7bbbae-9771-46f2-9e4d-2489e0ffc702', // SessionModule
+	'a4a9c1e2-1e54-4c7f-af06-4ca341198fac', // ExternalConnectionModule
+	'a78d9ce3-4e0c-48d5-9863-ae7342eedf94', // OrdinaryApplicationModule
+]);
+
+function padHex(n: number, width: number): string {
+	return n.toString(16).padStart(width, '0');
+}
+
+/** GUID Windows mixed-endian (как в бинарном moduleIDStr платформы). */
+function guidFromMixedEndian(buf: Buffer, offset: number): string | undefined {
+	if (offset < 0 || offset + 16 > buf.length) return undefined;
+	const d1 = buf.readUInt32LE(offset);
+	const d2 = buf.readUInt16LE(offset + 4);
+	const d3 = buf.readUInt16LE(offset + 6);
+	const d4 = buf.subarray(offset + 8, offset + 10).toString('hex');
+	const d5 = buf.subarray(offset + 10, offset + 16).toString('hex');
+	return `${padHex(d1, 8)}-${padHex(d2, 4)}-${padHex(d3, 4)}-${d4}-${d5}`.toLowerCase();
+}
+
+function rdbgValueToBuffer(raw: unknown): Buffer | undefined {
+	if (raw == null) return undefined;
+	if (Buffer.isBuffer(raw)) return raw.length > 0 ? raw : undefined;
+	if (typeof raw !== 'string' || raw.length === 0) return undefined;
+	const trimmed = raw.replace(/\s/g, '');
+	if (/^[A-Za-z0-9+/]+={0,2}$/.test(trimmed) && trimmed.length % 4 === 0 && trimmed.length >= 8) {
+		try {
+			const buf = Buffer.from(trimmed, 'base64');
+			if (buf.length > 0) return buf;
+		} catch {
+			// не Base64
+		}
+	}
+	return Buffer.from(raw, 'latin1');
+}
+
+function isMostlyPrintableText(s: string): boolean {
+	if (!s) return false;
+	let bad = 0;
+	for (let i = 0; i < s.length; i++) {
+		const c = s.charCodeAt(i);
+		if (c === 0xfffd) {
+			bad++;
+			continue;
+		}
+		if (c < 0x20 && c !== 9 && c !== 10 && c !== 13) bad++;
+	}
+	if (bad / s.length > 0.08) return false;
+	return /[\u0400-\u04FFa-zA-Z0-9.]/.test(s);
+}
+
+/** moduleIDStr/presentation — xs:base64Binary: UTF-8, UTF-16LE или бинарные GUID. */
+function decodeRdbgText(buf: Buffer | undefined): string {
+	if (!buf || buf.length === 0) return '';
+	const utf8 = buf.toString('utf8').replace(/\0/g, '').trim();
+	if (utf8 && !utf8.includes('\uFFFD') && isMostlyPrintableText(utf8)) return utf8;
+	const utf16 = buf.toString('utf16le').replace(/\0/g, '').trim();
+	if (utf16 && isMostlyPrintableText(utf16)) return utf16;
+	return '';
+}
+
+function parseBslModuleIdFromBinary(buf: Buffer): Partial<BslModuleIdInternal> {
+	const result: Partial<BslModuleIdInternal> = {};
+	const uri = parsePingDataBinary(buf);
+	if (uri.objectId) result.objectId = uri.objectId;
+	if (uri.propertyId) result.propertyId = uri.propertyId;
+	const uriStr = buf.toString('utf8');
+	const extMatch = uriStr.match(/extensionName='([^']+)'/i) || uriStr.match(/;ext='([^']+)'/i);
+	if (extMatch) result.extensionName = extMatch[1];
+	if (/urn:module:ext:/i.test(uriStr)) result.type = 'ExtensionModule';
+
+	if (!result.propertyId || !result.objectId) {
+		for (let i = 0; i <= buf.length - 16; i++) {
+			const g = guidFromMixedEndian(buf, i);
+			if (!g || !KNOWN_BSL_PROPERTY_IDS.has(g)) continue;
+			result.propertyId = result.propertyId || g;
+			const before = guidFromMixedEndian(buf, i - 16);
+			const after = guidFromMixedEndian(buf, i + 16);
+			if (before && !KNOWN_BSL_PROPERTY_IDS.has(before)) result.objectId = result.objectId || before;
+			else if (after && !KNOWN_BSL_PROPERTY_IDS.has(after)) result.objectId = result.objectId || after;
+			break;
+		}
+	}
+	if (result.extensionName) result.type = 'ExtensionModule';
+	return result;
+}
+
+function parseBslModuleIdFromXmlNode(mid: unknown): BslModuleIdInternal | undefined {
+	if (mid == null) return undefined;
+	if (typeof mid === 'string') {
+		const buf = rdbgValueToBuffer(mid);
+		if (!buf) return undefined;
+		const parsed = parseBslModuleIdFromBinary(buf);
+		if (!parsed.objectId && !parsed.propertyId) return undefined;
+		return {
+			type: parsed.type ?? (parsed.extensionName ? 'ExtensionModule' : 'ConfigModule'),
+			extensionName: parsed.extensionName ?? '',
+			objectId: parsed.objectId ?? '',
+			propertyId: parsed.propertyId ?? '',
+		};
+	}
+	if (typeof mid !== 'object') return undefined;
+	const m0 = mid as Record<string, unknown>;
+	const inner = m0.id && typeof m0.id === 'object' ? (m0.id as Record<string, unknown>) : m0;
+	const typeRaw = String(inner.type ?? inner.Type ?? '');
+	const extensionName = String(inner.extensionName ?? inner.ExtensionName ?? '');
+	const objectId = String(inner.objectID ?? inner.objectId ?? inner.ObjectID ?? '').trim();
+	const propertyId = String(inner.propertyID ?? inner.propertyId ?? inner.PropertyID ?? '').trim();
+	if (!objectId && !propertyId && !extensionName) return undefined;
+	const type: BslModuleIdInternal['type'] =
+		typeRaw === 'ExtensionModule' || extensionName ? 'ExtensionModule' : 'ConfigModule';
+	return { type, extensionName, objectId, propertyId };
+}
+
+/** Кадр стека из XML ping/getCallStack. Поле платформы — moduleID (не moduleId). */
+function parseStackItemFromXml(s: Record<string, unknown>): StackItemViewInfoData {
+	const midRaw = s.moduleID ?? s.moduleId ?? s.ModuleId ?? s.ModuleID;
+	let moduleId = parseBslModuleIdFromXmlNode(midRaw);
+	const lineNo = s.lineNo ?? s.LineNo ?? s.line;
+	const moduleIdStrRaw = s.moduleIDStr ?? s.moduleIdStr ?? s.ModuleIDStr ?? s.ModuleIdStr;
+	const moduleIdBuf = rdbgValueToBuffer(moduleIdStrRaw);
+	const moduleIdStr = decodeRdbgText(moduleIdBuf);
+	if ((!moduleId?.objectId || !moduleId?.propertyId) && moduleIdBuf) {
+		const fromBin = parseBslModuleIdFromBinary(moduleIdBuf);
+		moduleId = {
+			type: fromBin.type ?? moduleId?.type ?? (fromBin.extensionName || moduleId?.extensionName ? 'ExtensionModule' : 'ConfigModule'),
+			extensionName: fromBin.extensionName || moduleId?.extensionName || '',
+			objectId: fromBin.objectId || moduleId?.objectId || '',
+			propertyId: fromBin.propertyId || moduleId?.propertyId || '',
+		};
+	}
+	const presRaw = s.presentation ?? s.Presentation;
+	const presBuf = rdbgValueToBuffer(presRaw);
+	let presentation = decodeRdbgText(presBuf);
+	if (!presentation && typeof presRaw === 'string' && isMostlyPrintableText(presRaw)) presentation = presRaw.trim();
+	return {
+		moduleId,
+		moduleIdStr: moduleIdStr || undefined,
+		lineNo: typeof lineNo === 'number' ? lineNo : parseInt(String(lineNo ?? 0), 10),
+		presentation,
+		isFantom: !!(s.isFantom ?? s.IsFantom),
+	};
+}
+
 /** Извлекает targetId как строку из объекта result (targetID может быть вложенным объектом с полем id). */
 function getTargetIdFromResult(obj: Record<string, unknown>): string {
 	const t = obj.targetId ?? obj.TargetId ?? obj.targetID;
@@ -1451,35 +1611,9 @@ function parseCallStackFormedFromPingResponse(xml: string): CallStackFormedResul
 
 			const stackItems = Array.isArray(callStack) ? callStack : [callStack];
 			// Сервер отдаёт [root, parent, current] — DAP ожидает [current, ..., root]
-			const callStackData: StackItemViewInfoData[] = stackItems.map((si: unknown) => {
-				const s = si as Record<string, unknown>;
-				const mid = s.moduleId ?? s.ModuleId;
-				let moduleId: BslModuleIdInternal | undefined;
-				if (mid && typeof mid === 'object') {
-					const m = mid as Record<string, unknown>;
-					moduleId = {
-						type: (m.type as BslModuleIdInternal['type']) ?? 'ConfigModule',
-						extensionName: String(m.extensionName ?? m.ExtensionName ?? ''),
-						objectId: String(m.objectID ?? m.objectId ?? m.ObjectID ?? ''),
-						propertyId: String(m.propertyID ?? m.propertyId ?? m.PropertyID ?? ''),
-					};
-				}
-				const lineNo = s.lineNo ?? s.LineNo ?? s.line;
-				// moduleIDStr, presentation в Messages.cs — base64Binary (UTF-8/UTF-16)
-				const moduleIdStrRaw = s.moduleIDStr ?? s.moduleIdStr ?? s.ModuleIDStr ?? s.ModuleIdStr;
-				const moduleIdStr = typeof moduleIdStrRaw === 'string' ? decodeBase64ToUtf8(moduleIdStrRaw) : '';
-				const presRaw = s.presentation ?? s.Presentation;
-				const presentation = typeof presRaw === 'string' && presRaw.length > 0
-					? (decodeBase64ToUtf8(presRaw) || presRaw)
-					: '';
-				return {
-					moduleId,
-					moduleIdStr: moduleIdStr || undefined,
-					lineNo: typeof lineNo === 'number' ? lineNo : parseInt(String(lineNo ?? 0), 10),
-					presentation,
-					isFantom: !!(s.isFantom ?? s.IsFantom),
-				};
-			});
+			const callStackData: StackItemViewInfoData[] = stackItems.map((si: unknown) =>
+				parseStackItemFromXml(si as Record<string, unknown>),
+			);
 
 			return { callStack: callStackData.reverse(), targetId, reason, stopByBp: !!stopByBp, suspendedByOther: !!suspendedByOther };
 		}
@@ -1563,34 +1697,9 @@ function parsePingDebugUIParamsResponse(xml: string): PingDebugUIParamsResult | 
 				else if (suspendedByOther) reason = 'Step';
 
 				const stackItems = callStack != null ? (Array.isArray(callStack) ? callStack : [callStack]) : [];
-				const callStackData: StackItemViewInfoData[] = stackItems.map((si: unknown) => {
-					const s = si as Record<string, unknown>;
-					const mid = s.moduleId ?? s.ModuleId;
-					let moduleId: BslModuleIdInternal | undefined;
-					if (mid && typeof mid === 'object') {
-						const m = mid as Record<string, unknown>;
-						moduleId = {
-							type: (m.type as BslModuleIdInternal['type']) ?? 'ConfigModule',
-							extensionName: String(m.extensionName ?? m.ExtensionName ?? ''),
-							objectId: String(m.objectID ?? m.objectId ?? m.ObjectID ?? ''),
-							propertyId: String(m.propertyID ?? m.propertyId ?? m.PropertyID ?? ''),
-						};
-					}
-					const lineNo = s.lineNo ?? s.LineNo ?? s.line;
-					const moduleIdStrRaw = s.moduleIDStr ?? s.moduleIdStr ?? s.ModuleIDStr ?? s.ModuleIdStr;
-					const moduleIdStr = typeof moduleIdStrRaw === 'string' ? decodeBase64ToUtf8(moduleIdStrRaw) : '';
-					const presRaw = s.presentation ?? s.Presentation;
-					const presentation = typeof presRaw === 'string' && presRaw.length > 0
-						? (decodeBase64ToUtf8(presRaw) || presRaw)
-						: '';
-					return {
-						moduleId,
-						moduleIdStr: moduleIdStr || undefined,
-						lineNo: typeof lineNo === 'number' ? lineNo : parseInt(String(lineNo ?? 0), 10),
-						presentation,
-						isFantom: !!(s.isFantom ?? s.IsFantom),
-					};
-				});
+				const callStackData: StackItemViewInfoData[] = stackItems.map((si: unknown) =>
+					parseStackItemFromXml(si as Record<string, unknown>),
+				);
 
 				const dataBase64Raw = resp.resultStr ?? resp.ResultStr ?? obj.resultStr ?? obj.ResultStr;
 				const dataBase64 = typeof dataBase64Raw === 'string' && dataBase64Raw.trim() !== '' ? dataBase64Raw.trim() : undefined;
@@ -1776,34 +1885,9 @@ function parseCallStackResponse(xml: string): StackItemViewInfoData[] {
 		
 		const stackItems = Array.isArray(callStack) ? callStack : [callStack];
 		// Сервер отдаёт [root, parent, current] — DAP ожидает [current, ..., root], переворачиваем
-		const result = stackItems.map((si: unknown) => {
-			const s = si as Record<string, unknown>;
-			const mid = s.moduleId ?? s.ModuleId;
-			let moduleId: BslModuleIdInternal | undefined;
-			if (mid && typeof mid === 'object') {
-				const m = mid as Record<string, unknown>;
-				moduleId = {
-					type: (m.type as BslModuleIdInternal['type']) ?? 'ConfigModule',
-					extensionName: String(m.extensionName ?? m.ExtensionName ?? ''),
-					objectId: String(m.objectID ?? m.objectId ?? m.ObjectID ?? ''),
-					propertyId: String(m.propertyID ?? m.propertyId ?? m.PropertyID ?? ''),
-				};
-			}
-			const lineNo = s.lineNo ?? s.LineNo ?? s.line;
-			const moduleIdStrRaw = s.moduleIDStr ?? s.moduleIdStr ?? s.ModuleIDStr ?? s.ModuleIdStr;
-			const moduleIdStr = typeof moduleIdStrRaw === 'string' ? decodeBase64ToUtf8(moduleIdStrRaw) : '';
-			const presRaw = s.presentation ?? s.Presentation ?? '';
-			const presentation = typeof presRaw === 'string' && presRaw.length > 0
-				? (decodeBase64ToUtf8(presRaw) || String(presRaw))
-				: '';
-			return {
-				moduleId,
-				moduleIdStr: moduleIdStr || undefined,
-				lineNo: typeof lineNo === 'number' ? lineNo : parseInt(String(lineNo ?? 0), 10),
-				presentation,
-				isFantom: !!(s.isFantom ?? s.IsFantom),
-			};
-		});
+		const result = stackItems.map((si: unknown) =>
+			parseStackItemFromXml(si as Record<string, unknown>),
+		);
 		return result.reverse();
 	} catch {
 		return [];

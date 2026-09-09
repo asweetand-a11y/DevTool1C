@@ -395,6 +395,20 @@ export function resolveRdbgExtensionNameToFolder(workspaceRoot: string, rdbgExte
 	return ext;
 }
 
+/** Имена папок расширений (src/cfe, cfe) для разбора presentation вида Префикс_Документ.X.МодульОбъекта. */
+function listExtensionFolderNames(workspaceRoot: string): string[] {
+	const names: string[] = [];
+	for (const cfeBase of [path.join(workspaceRoot, 'src', 'cfe'), path.join(workspaceRoot, 'cfe')]) {
+		if (!fs.existsSync(cfeBase) || !fs.statSync(cfeBase).isDirectory()) continue;
+		for (const entry of fs.readdirSync(cfeBase, { withFileTypes: true })) {
+			if (!entry.isDirectory()) continue;
+			if (fs.existsSync(path.join(cfeBase, entry.name, 'Configuration.xml'))) names.push(entry.name);
+		}
+		break;
+	}
+	return names;
+}
+
 /**
  * Обратный поиск: путь к файлу .bsl по objectID и propertyID (для маппинга стека вызовов).
  * extensionName — имя расширения из RDBG (пустая строка для основной конфигурации).
@@ -487,8 +501,16 @@ export function getModulePathFromStackPresentation(
 	extensionName?: string,
 ): string {
 	if (!workspaceRoot || !presentation?.trim()) return '';
-	const head = presentation.split('(')[0].trim();
-	const ext = extensionName;
+	let head = presentation.split('(')[0].trim();
+	let ext = (extensionName ?? '').trim();
+	for (const folder of listExtensionFolderNames(workspaceRoot)) {
+		const prefix = folder + '_';
+		if (head.toLowerCase().startsWith(prefix.toLowerCase())) {
+			head = head.slice(prefix.length);
+			if (!ext) ext = folder;
+			break;
+		}
+	}
 	const byId = (moduleIdStr: string): string => getModulePathByModuleIdStr(workspaceRoot, moduleIdStr, ext);
 
 	const cm = head.match(/^ОбщийМодуль\.([^.]+)\.Модуль(?:\.|\(|$)/i);
