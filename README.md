@@ -193,7 +193,7 @@
 Чтобы агент работал с **текущей** остановленной сессией:
 
 1. Остановитесь на точке в модуле BSL.
-2. MCP: **`extension-1c-debug`**:
+2. MCP: `extension-1c-debug`:
   - Запуск: `onec_debug_start` (конфигурация `type=onec` из `.vscode/launch.json`, параметр `configurationName` по желанию), `onec_debug_stop`.
   - Точки останова: `onec_debug_set_breakpoint` с `path` (абсолютный или относительно workspace / `src/cf` / `src/cfe/<имя>`), `line` (с 1), для расширения — `extensionName`. Опция `replaceFile` снимает другие точки в этом файле. Точка ставится в редакторе Cursor; адаптер отправляет её в RDBG, как при клике в gutter.
   - Чтение: `onec_debug_status` (в т.ч. список launch и текущие точки), `onec_debug_stack`, `onec_debug_variables`, `onec_debug_evaluate`.
@@ -259,6 +259,5 @@ e:\DATA1C\BASE\src\cf\Documents\Сборка\Ext\ObjectModule.bsl
 
 ## ВАЖНО
 
-- за основу взят проект [https://github.com/yellow-hammer/vscode-1c-platform-tools](https://github.com/yellow-hammer/vscode-1c-platform-tools)
 - отладка протестирована для базы в файловом варианте на платформе 8.3.27
 
