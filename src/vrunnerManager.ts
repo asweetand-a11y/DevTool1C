@@ -751,6 +751,78 @@ export class VRunnerManager {
 	}
 
 	/**
+	 * Получает дополнительные ключи запуска платформы из env.json.
+	 * Читает секцию default['--additional'] (например /NoWait).
+	 * @returns Строка ключей или пустая строка, если параметр не задан
+	 */
+	public async getAdditionalParam(): Promise<string> {
+		if (!this.workspaceRoot) {
+			return '';
+		}
+
+		try {
+			const env = await this.readEnvJson();
+			if (env.default) {
+				const additional = env.default['--additional'];
+				return typeof additional === 'string' ? additional : '';
+			}
+		} catch {
+			// Если не удалось прочитать env.json, дополнительные ключи не передаём
+		}
+
+		return '';
+	}
+
+	/**
+	 * При первой активации подставляет имя текущего компьютера в env.json `--debug-server`,
+	 * если значение не задано или осталось шаблонным. Уже указанный хост не перезаписывается.
+	 */
+	public async ensureLocalDebugServerInEnvJson(): Promise<void> {
+		if (!this.workspaceRoot) {
+			return;
+		}
+
+		try {
+			const env = await this.readEnvJson();
+			if (!env.default || typeof env.default !== 'object') {
+				return;
+			}
+
+			const current = env.default['--debug-server'];
+			if (!this.isUnsetDebugServer(current)) {
+				return;
+			}
+
+			env.default['--debug-server'] = os.hostname();
+			await this.writeEnvJson(env);
+		} catch {
+			// Нет env.json или файл некорректен — ничего не меняем
+		}
+	}
+
+	/**
+	 * Проверяет, что `--debug-server` ещё не задан реальным хостом (пусто или шаблон).
+	 * @param value — текущее значение из env.json
+	 * @returns true, если можно подставить имя компьютера
+	 */
+	private isUnsetDebugServer(value: unknown): boolean {
+		if (typeof value !== 'string') {
+			return true;
+		}
+
+		const trimmed = value.trim();
+		if (!trimmed) {
+			return true;
+		}
+
+		if (trimmed === 'Имя компьютера сервера отладки') {
+			return true;
+		}
+
+		return trimmed.startsWith('<') && trimmed.endsWith('>');
+	}
+
+	/**
 	 * Получает путь к корню workspace
 	 * 
 	 * @returns Путь к workspace или undefined, если workspace не открыт

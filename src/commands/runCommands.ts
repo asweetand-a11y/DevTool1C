@@ -19,12 +19,16 @@ export class RunCommands extends BaseCommand {
 
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getRunEnterpriseCommandName();
+		const additional = await this.vrunner.getAdditionalParam();
 
 		const args = [
 			'runEnterprise',
-			'--ibconnection', ibParams.connection,
-			'--additional', '/NoWait'
+			'--ibconnection', ibParams.connection
 		];
+
+		if (additional) {
+			args.push('--additional', additional);
+		}
 
 		if (ibParams.username) {
 			args.push('--db-user', ibParams.username);
@@ -56,12 +60,16 @@ export class RunCommands extends BaseCommand {
 
 		const ibParams = await this.vrunner.getIbConnectionParams();
 		const commandName = getRunDesignerCommandName();
+		const additional = await this.vrunner.getAdditionalParam();
 
 		const args = [
 			'runDesigner',
-			'--ibconnection', ibParams.connection,
-			'--additional', '/NoWait'
+			'--ibconnection', ibParams.connection
 		];
+
+		if (additional) {
+			args.push('--additional', additional);
+		}
 
 		if (ibParams.username) {
 			args.push('--db-user', ibParams.username);

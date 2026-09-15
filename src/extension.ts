@@ -91,6 +91,9 @@ export async function activate(context: vscode.ExtensionContext) {
 	);
 
 	const vrunnerManager = VRunnerManager.getInstance(context);
+	if (isProject) {
+		await vrunnerManager.ensureLocalDebugServerInEnvJson();
+	}
 
 	const infobaseCommands = new InfobaseCommands();
 	const configurationCommands = new ConfigurationCommands();
