@@ -23,6 +23,7 @@ import * as vscode from 'vscode';
 import { randomUUID } from 'node:crypto';
 import { getLastDbgsLaunch } from './dbgsLaunchInfo';
 import { ensureDbgsWhenDebugging } from './dbgsAutoLaunch';
+import { ensureIbHttpDebugProtocol } from './ibDebugProtocol';
 import { buildNestedEvalExpression, enrichEvalExprForCollections } from './evalExprEnrich';
 import { format1cv8cCommandLine, launch1cv8c, resolvePlatformBin } from './launch1cv8c';
 import { getVariableNamesFromProcedureAtLine } from './bslProcedureVariables';
@@ -1294,6 +1295,17 @@ export class OnecDebugSession extends DebugSession {
 
 		this.rootProject = workspaceRoot;
 		this.rdbgInfoBaseAlias = args.infoBaseAlias ?? 'DefAlias';
+
+		const protocolCheck = ensureIbHttpDebugProtocol({
+			infoBase: args.infoBase,
+			ibconnection: args.ibconnection,
+			workspaceRoot,
+		});
+		this.sendEvent(new OutputEvent(`${protocolCheck.message}\n`, protocolCheck.ok ? 'console' : 'stderr'));
+		if (!protocolCheck.ok) {
+			this.sendErrorResponse(response, { id: 101, format: protocolCheck.message });
+			return;
+		}
 
 		let host = args.debugServerHost ?? 'localhost';
 		let port = args.debugServerPort ?? 1560;
