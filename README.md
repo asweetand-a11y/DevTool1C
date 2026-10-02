@@ -202,7 +202,38 @@
 3. Снимок стека при каждом останове пишется в `%TEMP%/1c-dev-tools-debug-snapshot.json` (Windows: каталог временных файлов пользователя). Агент может прочитать этот файл, в том числе из другого чата на той же машине.
 4. Команда палитры **«1C: Скопировать стек отладки для агента»** (`1c-dev-tools.debug.copyAgentSnapshot`) копирует JSON стека в буфер — можно вставить в чат.
 
+### Настройки для Cline
 
+Cline **не видит** MCP отладки автоматически.
+
+HTTP-сервер при активации расширения слушает фиксированный адрес:
+
+`http://127.0.0.1:18791/mcp`
+
+Чтобы Cline подключился:
+
+1. PlatformTools должно быть **включено в том же окне**, где работает Cline.
+2. В Cline: MCP Servers → Remote / HTTP, тип **Streamable HTTP**.
+3. Либо добавьте сервер в `cline_mcp_settings.json`:
+  - Cursor: `%APPDATA%\Cursor\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+  - VS Code: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
+
+```json
+{
+  "mcpServers": {
+    "1c-debug": {
+      "disabled": false,
+      "timeout": 60,
+      "type": "streamableHttp",
+      "url": "http://127.0.0.1:18791/mcp"
+    }
+  }
+}
+```
+
+Если в вашей версии Cline поле называется `transportType`, укажите `"transportType": "streamableHttp"` вместо `"type"`.
+
+1. Обновите список MCP в Cline (Refresh / Restart). Должны появиться инструменты `onec_debug_status`, `onec_debug_stack`, `onec_debug_start` и остальные из списка выше.
 
 ### Просмотр переменных при отладке, панель Watch:
 
