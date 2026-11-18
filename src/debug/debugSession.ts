@@ -38,6 +38,7 @@ import {
 } from './metadataProvider';
 import { getDebugTimingConfig } from './debugTimingConfig';
 import { clearAgentDebugSnapshot, publishAgentDebugSnapshot } from './agentDebugSnapshot';
+import { publishDebugMcpOwner } from './agentDebugMcp';
 import { RdbgClient } from './rdbgClient';
 import {
 	AttachDebugUiResult,
@@ -157,6 +158,9 @@ export class OnecDebugSession extends DebugSession {
 	private debuggerId: string;
 	/** Алиас ИБ для RDBG (из launch.json infoBaseAlias или DefAlias). */
 	private rdbgInfoBaseAlias = 'DefAlias';
+	/** Фактический хост и порт dbgs этой сессии (не начало диапазона 1560). */
+	private liveDebugHost = '';
+	private liveDebugPort = 0;
 	/** Корень проекта (workspace) для маппинга путей к модулям. */
 	private rootProject: string;
 	private attached: boolean;
@@ -221,6 +225,7 @@ export class OnecDebugSession extends DebugSession {
 		}
 		if (
 			request.command === 'onec.getDebugTargets' ||
+			request.command === 'onec.setDebugServer' ||
 			request.command === 'onec.connectTargets' ||
 			request.command === 'onec.disconnectTarget' ||
 			request.command === 'onec.suspendTarget' ||
@@ -308,6 +313,55 @@ export class OnecDebugSession extends DebugSession {
 		this.sendResponse(response);
 	}
 
+	/**
+	 * Переключает attach на другой уже запущенный dbgs. Сервер отладки не стартует.
+ */
+	private async switchDebugServer(host: string, port: number): Promise<void> {
+		const logProtocol = vscode.workspace.getConfiguration('1c-dev-tools').get<boolean>('debug.logProtocol', false);
+		const client = new RdbgClient(host, port, {
+			logProtocol,
+			timing: {
+				varFetchDelayMs: this.timingConfig.varFetchDelayMs,
+				calcWaitingTimeMs: this.timingConfig.calcWaitingTimeMs,
+				evalExprRetryDelaysMs: this.timingConfig.evalExprRetryDelaysMs,
+			},
+		});
+		await rdbgTestWithRetry(client, host, port, (line) => {
+			this.sendEvent(new OutputEvent(line, 'console'));
+		});
+		if (this.rdbgClient && this.attached) {
+			try {
+				await this.rdbgClient.detachDebugUI({
+					infoBaseAlias: this.rdbgInfoBaseAlias,
+					idOfDebuggerUi: this.debuggerId,
+				});
+			} catch {
+				// прежний сервер мог уже не отвечать
+			}
+		}
+		const previousCount = this.targets.length;
+		this.targets = [];
+		this.threadsCallStack.clear();
+		for (let threadId = 1; threadId <= previousCount; threadId++) {
+			this.sendEvent(new ThreadEvent('exited', threadId));
+		}
+		const attachResponse = await client.attachDebugUI({
+			infoBaseAlias: this.rdbgInfoBaseAlias,
+			idOfDebuggerUi: this.debuggerId,
+			options: { foregroundAbility: true },
+		});
+		const result = String(attachResponse.result ?? '').trim();
+		if (result.toLowerCase() !== AttachDebugUiResult.Registered) {
+			throw new Error(getAttachResultMessage(result, { attachMode: true }));
+		}
+		this.rdbgClient = client;
+		this.attached = true;
+		this.liveDebugHost = host;
+		this.liveDebugPort = port;
+		publishDebugMcpOwner(host, port);
+		this.sendEvent(new OutputEvent(`attach: RDBG ${host}:${port}\n`, 'console'));
+	}
+
 	/** Кастомные запросы панели «Предметы отладки» (attach). */
 	private async handleOnecDebugTargetsRequest(request: DebugProtocol.Request): Promise<void> {
 		const req = request as unknown as { seq?: number };
@@ -325,12 +379,24 @@ export class OnecDebugSession extends DebugSession {
 			this.sendResponse(response);
 		};
 		try {
+			const args = (request.arguments ?? {}) as Record<string, unknown>;
+			if (request.command === 'onec.setDebugServer') {
+				const host = typeof args.host === 'string' ? args.host.trim() : '';
+				const port = typeof args.port === 'number' ? args.port : parseInt(String(args.port ?? ''), 10);
+				if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) {
+					sendErr('Укажите сервер отладки и порт');
+					return;
+				}
+				await this.switchDebugServer(host, port);
+				response.body = { debugServerHost: this.liveDebugHost, debugServerPort: this.liveDebugPort };
+				this.sendResponse(response);
+				return;
+			}
 			if (!this.rdbgClient || !this.attached) {
 				sendErr('Нет активной сессии отладки');
 				return;
 			}
 			const base = { infoBaseAlias: this.rdbgInfoBaseAlias, idOfDebuggerUi: this.debuggerId };
-			const args = (request.arguments ?? {}) as Record<string, unknown>;
 
 			const serializeRow = (t: DebugTargetId) => ({
 				id: t.id,
@@ -341,23 +407,15 @@ export class OnecDebugSession extends DebugSession {
 				seanceNo: t.seanceNo ?? null,
 			});
 
-			const filterByAutoAttach = (list: DebugTargetId[]): DebugTargetId[] => {
-				if (this.autoAttachTypes.length === 0) return list;
-				return list.filter((t) => {
-					const tt = t.targetType ?? '';
-					if (!tt.trim()) return true;
-					return matchesAutoAttachType(tt, this.autoAttachTypes);
-				});
-			};
-
 			if (request.command === 'onec.getDebugTargets') {
 				const list = await this.fetchDbgTargetsFromServer();
-				const filtered = filterByAutoAttach(list);
 				const connectedIds = new Set(this.targets.map((t) => t.id));
-				const available = filtered.filter((t) => t.id && !connectedIds.has(t.id));
+				const available = list.filter((t) => t.id && !connectedIds.has(t.id));
 				response.body = {
 					available: available.map(serializeRow),
 					connected: this.targets.map(serializeRow),
+					debugServerHost: this.liveDebugHost,
+					debugServerPort: this.liveDebugPort,
 				};
 				this.sendResponse(response);
 				return;
@@ -374,11 +432,10 @@ export class OnecDebugSession extends DebugSession {
 					return;
 				}
 				const fromServer = await this.fetchDbgTargetsFromServer();
-				const filtered = filterByAutoAttach(fromServer);
 				const prevIds = new Set(this.targets.map((t) => t.id));
 				const reallyNew: DebugTargetId[] = [];
 				for (const id of ids) {
-					const t = filtered.find((x) => x.id === id);
+					const t = fromServer.find((x) => x.id === id);
 					if (t && !prevIds.has(t.id)) reallyNew.push(t);
 				}
 				if (reallyNew.length === 0) {
@@ -801,6 +858,8 @@ export class OnecDebugSession extends DebugSession {
 						rootProject: this.rootProject,
 						targets: this.targets,
 						stacks: this.threadsCallStack,
+					debugServerHost: this.liveDebugHost,
+					debugServerPort: this.liveDebugPort,
 					});
 					// Не очищаем evalExprCache — при InvalidatedEvent возвращаем кэш, пока сервер не ответит. Иначе переменные «обнуляются» при быстром F11.
 					const stoppedEv = new StoppedEvent('step', threadId);
@@ -894,6 +953,8 @@ export class OnecDebugSession extends DebugSession {
 			rootProject: this.rootProject,
 			targets: this.targets,
 			stacks: this.threadsCallStack,
+		debugServerHost: this.liveDebugHost,
+		debugServerPort: this.liveDebugPort,
 		});
 		// Не очищаем evalExprCache на step — иначе Watch показывает «Неопределено» пока сервер не ответит на evalExpr.
 		const stoppedEv = new StoppedEvent(csf.reason, threadId);
@@ -1307,11 +1368,13 @@ export class OnecDebugSession extends DebugSession {
 			return;
 		}
 
-		let host = args.debugServerHost ?? 'localhost';
+		let host = (args.debugServerHost ?? 'localhost').trim() || 'localhost';
 		let port = args.debugServerPort ?? 1560;
 
-		// Только launch: автозапуск dbgs из env.json. attach — к уже запущенному серверу (конфигуратор и т.д.), иначе занялся бы следующий порт из диапазона.
-		const ensured = _launch ? await ensureDbgsWhenDebugging(workspaceRoot || undefined, args.debugServerHost) : undefined;
+		// dbgs поднимается только в launch. Attach берёт хост и порт из конфигурации и не запускает сервер.
+		const ensured = _launch
+			? await ensureDbgsWhenDebugging(workspaceRoot || undefined, args.debugServerHost)
+			: undefined;
 		if (ensured) {
 			host = ensured.rdbgHost;
 			port = ensured.rdbgPort;
@@ -1323,7 +1386,17 @@ export class OnecDebugSession extends DebugSession {
 			);
 		}
 
+		this.liveDebugHost = host;
+		this.liveDebugPort = port;
+		publishDebugMcpOwner(host, port);
+
 		this.sendEvent(new OutputEvent(`PID процесса Cursor (extension host): ${process.pid}\n`, 'console'));
+		this.sendEvent(
+			new OutputEvent(
+				`MCP отладки: это окно — владелец отладки (PID ${process.pid}), dbgs ${host}:${port}. Инструменты MCP из других окон пересылаются сюда.\n`,
+				'console',
+			),
+		);
 		if (ensured) {
 			const dbgsInfo = getLastDbgsLaunch();
 			if (dbgsInfo) {
@@ -1334,7 +1407,7 @@ export class OnecDebugSession extends DebugSession {
 		} else {
 			this.sendEvent(
 				new OutputEvent(
-					`attach: RDBG ${host}:${port} — расширение не запускает dbgs (используйте уже запущенный сервер отладки).\n`,
+					`attach: RDBG ${host}:${port} — сервер отладки не запускается, адрес из конфигурации.\n`,
 					'console',
 				),
 			);
@@ -1413,14 +1486,7 @@ export class OnecDebugSession extends DebugSession {
 						));
 					}
 				}
-				if (!_launch && this.autoAttachTypes.length > 0) {
-					this.sendEvent(
-						new OutputEvent(
-							`[DEBUG] Режим attach: autoAttachTypes (${this.autoAttachTypes.join(', ')}) используются только как фильтр списка доступных целей.\n`,
-							'console',
-						),
-					);
-				}
+
 				
 				try {
 					// Задержка перед первым опросом: даём серверу 1С время обработать attachDebugUI

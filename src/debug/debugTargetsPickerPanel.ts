@@ -20,6 +20,11 @@ let boundSession: vscode.DebugSession | undefined;
 
 function getPickerHtml(webview: vscode.Webview): string {
 	const body = `
+	<div class="input-row">
+		<vscode-textfield id="dbgHost" placeholder="localhost">Сервер</vscode-textfield>
+		<vscode-textfield id="dbgPort" placeholder="1560">Порт</vscode-textfield>
+		<vscode-button id="btnApplyEndpoint">Применить</vscode-button>
+	</div>
 	<div class="toolbar">
 		<vscode-button id="btnRefresh">Обновить</vscode-button>
 		<vscode-button id="btnConnect" secondary>Подключить</vscode-button>
@@ -103,9 +108,19 @@ function getPickerHtml(webview: vscode.Webview): string {
 			}
 		}
 
+		function setEndpointFields(host, port, force) {
+			const h = document.getElementById('dbgHost');
+			const p = document.getElementById('dbgPort');
+			if (force || !h.value) h.value = host || '';
+			if (force || !p.value) p.value = port != null && port !== '' ? String(port) : '';
+		}
+
 		window.addEventListener('message', (event) => {
 			const msg = event.data;
 			if (msg.type === 'data') {
+				if (msg.debugServerHost != null || msg.debugServerPort != null) {
+					setEndpointFields(msg.debugServerHost, msg.debugServerPort, !!msg.fillEndpoint);
+				}
 				renderRows('tblAvail', msg.available || [], 'avail');
 				renderRows('tblConn', msg.connected || [], 'conn');
 				const st = document.getElementById('status');
@@ -120,6 +135,11 @@ function getPickerHtml(webview: vscode.Webview): string {
 			}
 		});
 
+		document.getElementById('btnApplyEndpoint').addEventListener('click', () => {
+			const host = (document.getElementById('dbgHost').value || '').trim();
+			const port = parseInt(String(document.getElementById('dbgPort').value || '').trim(), 10);
+			vscode.postMessage({ type: 'setEndpoint', host, port });
+		});
 		document.getElementById('btnRefresh').addEventListener('click', () => {
 			vscode.postMessage({ type: 'refresh' });
 		});
@@ -147,7 +167,12 @@ function getPickerHtml(webview: vscode.Webview): string {
 }
 
 /** VS Code отдаёт либо тело ответа, либо объект с полем body — нормализуем. */
-function normalizePickerPayload(raw: unknown): { available: PickerTargetRow[]; connected: PickerTargetRow[] } {
+function normalizePickerPayload(raw: unknown): {
+	available: PickerTargetRow[];
+	connected: PickerTargetRow[];
+	debugServerHost?: string;
+	debugServerPort?: number;
+} {
 	const o = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : null;
 	const inner =
 		o && 'body' in o && o.body !== null && typeof o.body === 'object'
@@ -155,28 +180,59 @@ function normalizePickerPayload(raw: unknown): { available: PickerTargetRow[]; c
 			: o;
 	const a = inner?.available;
 	const c = inner?.connected;
+	const host = typeof inner?.debugServerHost === 'string' ? inner.debugServerHost : undefined;
+	const portRaw = inner?.debugServerPort;
+	const port = typeof portRaw === 'number' ? portRaw : undefined;
 	return {
 		available: Array.isArray(a) ? (a as PickerTargetRow[]) : [],
 		connected: Array.isArray(c) ? (c as PickerTargetRow[]) : [],
+		debugServerHost: host,
+		debugServerPort: port,
 	};
 }
 
-async function fetchAndPost(panel: vscode.WebviewPanel, session: vscode.DebugSession, status?: string, isError?: boolean): Promise<void> {
+function postPicker(
+	panel: vscode.WebviewPanel,
+	session: vscode.DebugSession,
+	available: PickerTargetRow[],
+	connected: PickerTargetRow[],
+	debugServerHost: string | undefined,
+	debugServerPort: number | undefined,
+	status: string | undefined,
+	isError: boolean,
+	fillEndpoint: boolean,
+): void {
+	const cfg = session.configuration;
+	const host = debugServerHost || String(cfg.debugServerHost ?? 'localhost');
+	const port = debugServerPort ?? cfg.debugServerPort ?? '';
+	const counts = `Доступно: ${available.length}, подключено: ${connected.length}.`;
+	const hint =
+		available.length === 0 && connected.length === 0
+			? ` Сервер ${host}:${port}. Если предметы на другом порту диапазона — укажите его и нажмите «Применить».`
+			: '';
+	panel.webview.postMessage({
+		type: 'data',
+		available,
+		connected,
+		debugServerHost: host,
+		debugServerPort: port,
+		fillEndpoint,
+		status: [status, counts + hint].filter(Boolean).join(' '),
+		error: isError,
+	});
+}
+
+async function fetchAndPost(
+	panel: vscode.WebviewPanel,
+	session: vscode.DebugSession,
+	status?: string,
+	isError?: boolean,
+	fillEndpoint = false,
+): Promise<void> {
 	try {
 		const raw = await session.customRequest('onec.getDebugTargets', {});
-		const { available, connected } = normalizePickerPayload(raw);
-		const counts = `Доступно: ${available.length}, подключено: ${connected.length}.`;
-		const hint =
-			available.length === 0 && connected.length === 0
-				? ' Если пусто — убедитесь, что запущен клиент/сервер 1С с отладкой к этому dbgs.'
-				: '';
-		panel.webview.postMessage({
-			type: 'data',
-			available,
-			connected,
-			status: [status, counts + hint].filter(Boolean).join(' '),
-			error: !!isError,
-		});
+		const { available, connected, debugServerHost, debugServerPort } = normalizePickerPayload(raw);
+		postPicker(panel, session, available, connected, debugServerHost, debugServerPort, status, !!isError, fillEndpoint);
 	} catch (e) {
 		const msg = e instanceof Error ? e.message : String(e);
 		panel.webview.postMessage({
@@ -223,7 +279,7 @@ export function showDebugTargetsPicker(_context: vscode.ExtensionContext, sessio
 	panel.webview.html = getPickerHtml(panel.webview);
 
 	panel.webview.onDidReceiveMessage(
-		async (msg: { type?: string; id?: string }) => {
+		async (msg: { type?: string; id?: string; host?: string; port?: number }) => {
 			const sess = boundSession;
 			if (!sess || !sess.configuration || sess.type !== 'onec') {
 				void vscode.window.showWarningMessage('Сессия отладки 1С не активна.');
@@ -237,8 +293,15 @@ export function showDebugTargetsPicker(_context: vscode.ExtensionContext, sessio
 			try {
 				switch (msg.type) {
 					case 'ready':
-						await fetchAndPost(panel, s);
+						await fetchAndPost(panel, s, undefined, false, true);
 						break;
+					case 'setEndpoint': {
+						const host = (msg.host ?? '').trim();
+						const port = typeof msg.port === 'number' ? msg.port : parseInt(String(msg.port ?? ''), 10);
+						await s.customRequest('onec.setDebugServer', { host, port });
+						await fetchAndPost(panel, s, `Сервер отладки: ${host}:${port}`, false, true);
+						break;
+					}
 					case 'refresh':
 						await fetchAndPost(panel, s, 'Список обновлён');
 						break;

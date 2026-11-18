@@ -6,17 +6,178 @@
 
 import * as fs from 'node:fs';
 import * as http from 'node:http';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as vscode from 'vscode';
 import { getAgentDebugSnapshot, getAgentDebugSnapshotFile } from './agentDebugSnapshot';
+import { getLastDbgsLaunch } from './dbgsLaunchInfo';
 
 const SERVER_NAME = '1c-debug';
 /** Фиксированный порт: случайный после Reload расходится с URL в mcp.json — вызовы зависают. */
 const MCP_PORT = 18791;
+/** Порт только процесса, в котором есть сессия onec. Его не занимает окно без отладки. */
+const SESSION_BRIDGE_PORT = 18790;
 const MCP_SESSION_ID = '1c-debug-session';
+const MCP_OWNER_FILE = path.join(os.tmpdir(), '1c-dev-tools-mcp-owner.json');
+const BRIDGE_DIR = path.join(os.tmpdir(), '1c-dev-tools-debug-bridge');
 
 let server: http.Server | undefined;
+let sessionBridge: http.Server | undefined;
 let listenUrl = '';
+/** Сессия onec этого окна. activeDebugSession в Cursor часто пустой, пока фокус в чате. */
+let trackedOnecSession: vscode.DebugSession | undefined;
+
+function getOnecDebugSession(): vscode.DebugSession | undefined {
+	const active = vscode.debug.activeDebugSession;
+	if (active?.type === 'onec') {
+		trackedOnecSession = active;
+		return active;
+	}
+	return trackedOnecSession;
+}
+
+/** Повторная регистрация URL: окно с живой отладкой должно перебить регистрацию другого окна. */
+function registerCursorMcp(): void {
+	if (!listenUrl) return;
+	const cursorMcp = (
+		vscode as unknown as { cursor?: { mcp?: { registerServer: (c: unknown) => void } } }
+	).cursor?.mcp;
+	try {
+		cursorMcp?.registerServer?.({
+			name: SERVER_NAME,
+			server: { url: listenUrl },
+		});
+	} catch {
+		// не Cursor
+	}
+}
+
+/** Окно-владелец отладки: только оно исполняет инструменты MCP, остальные окна пересылают ему запросы. */
+interface McpOwnerFile {
+	url: string;
+	pid: number;
+	rootProject?: string;
+	debugServerHost?: string;
+	debugServerPort?: number;
+}
+
+let pendingDebugEndpoint: { host: string; port: number } | undefined;
+let sessionBridgeUrl = '';
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (e) {
+		return (e as NodeJS.ErrnoException).code === 'EPERM';
+	}
+}
+
+/** Владелец из файла. Запись умершего процесса удаляется. */
+function readMcpOwner(): McpOwnerFile | undefined {
+	try {
+		if (!fs.existsSync(MCP_OWNER_FILE)) return undefined;
+		const parsed = JSON.parse(fs.readFileSync(MCP_OWNER_FILE, 'utf8')) as McpOwnerFile;
+		if (!parsed?.url || !parsed.pid) return undefined;
+		if (!isProcessAlive(parsed.pid)) {
+			fs.unlinkSync(MCP_OWNER_FILE);
+			return undefined;
+		}
+		return parsed;
+	} catch {
+		return undefined;
+	}
+}
+
+/** Владелец отладки — другой процесс. */
+function foreignDebugOwner(): McpOwnerFile | undefined {
+	const owner = readMcpOwner();
+	return owner && owner.pid !== process.pid ? owner : undefined;
+}
+
+function writeMcpOwnerFile(): void {
+	const session = getOnecDebugSession();
+	if (!session && !pendingDebugEndpoint) return;
+	const url = sessionBridgeUrl || listenUrl;
+	if (!url) return;
+	const body: McpOwnerFile = {
+		url,
+		pid: process.pid,
+		rootProject: String(session?.configuration?.rootProject ?? '') || workspaceRoot(),
+		debugServerHost: pendingDebugEndpoint?.host,
+		debugServerPort: pendingDebugEndpoint?.port,
+	};
+	try {
+		fs.writeFileSync(MCP_OWNER_FILE, JSON.stringify(body), 'utf8');
+	} catch {
+		// окно останется без пересылки
+	}
+}
+
+/** Поднимает порт 18790 в том процессе, где реально идёт сессия. */
+let armDebugBridge: (() => void) | undefined;
+
+/** Делает это окно владельцем отладки и запоминает фактический dbgs. */
+export function publishDebugMcpOwner(host: string, port: number): void {
+	pendingDebugEndpoint = { host, port };
+	armDebugBridge?.();
+	writeMcpOwnerFile();
+	registerCursorMcp();
+}
+
+function clearMcpOwnerFile(): void {
+	pendingDebugEndpoint = undefined;
+	const current = readMcpOwner();
+	if (current && current.pid !== process.pid) return;
+	try {
+		if (fs.existsSync(MCP_OWNER_FILE)) fs.unlinkSync(MCP_OWNER_FILE);
+	} catch {
+		// игнорируем
+	}
+}
+
+function postToMcp(url: string, raw: string): Promise<string | undefined> {
+	let target: URL;
+	try {
+		target = new URL(url);
+	} catch {
+		return Promise.resolve(undefined);
+	}
+	return new Promise((resolve) => {
+		const req = http.request(
+			{
+				hostname: target.hostname,
+				port: target.port || 80,
+				path: `${target.pathname}${target.search}`,
+				method: 'POST',
+				headers: {
+					'Content-Type': 'application/json',
+					'Content-Length': Buffer.byteLength(raw),
+					'X-Debug-Mcp-Hop': '1',
+				},
+				timeout: 60000,
+			},
+			(res) => {
+				const chunks: Buffer[] = [];
+				res.on('data', (c) => chunks.push(c as Buffer));
+				res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+			},
+		);
+		req.on('error', () => resolve(undefined));
+		req.on('timeout', () => {
+			req.destroy();
+			resolve(undefined);
+		});
+		req.end(raw);
+	});
+}
+
+/** Пересылает запрос только окну, в котором запущена отладка. */
+async function forwardToDebugOwner(raw: string): Promise<string | undefined> {
+	const owner = foreignDebugOwner();
+	if (!owner) return undefined;
+	return postToMcp(owner.url, raw);
+}
 
 type JsonRpc = { jsonrpc?: string; id?: unknown; method?: string; params?: unknown };
 
@@ -33,7 +194,7 @@ function toolText(text: string, isError = false): unknown {
 }
 
 async function dapRequest(command: string, args?: unknown): Promise<unknown> {
-	const session = vscode.debug.activeDebugSession;
+	const session = getOnecDebugSession();
 	if (!session || session.type !== 'onec') {
 		throw new Error('Нет активной сессии отладки 1С (debugType=onec) в этом окне Cursor.');
 	}
@@ -42,6 +203,62 @@ async function dapRequest(command: string, args?: unknown): Promise<unknown> {
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+interface BridgeRequest {
+	id: string;
+	name: string;
+	args: Record<string, unknown>;
+	createdAt: number;
+}
+
+/** Запрос из окна без сессии. Ответ пишет окно, в котором есть onec. */
+function bridgeCall(name: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown | undefined> {
+	fs.mkdirSync(BRIDGE_DIR, { recursive: true });
+	const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+	const reqPath = path.join(BRIDGE_DIR, `req-${id}.json`);
+	const resPath = path.join(BRIDGE_DIR, `res-${id}.json`);
+	const body: BridgeRequest = { id, name, args, createdAt: Date.now() };
+	fs.writeFileSync(reqPath, JSON.stringify(body), 'utf8');
+	const deadline = Date.now() + timeoutMs;
+	return new Promise((resolve) => {
+		const tick = (): void => {
+			try {
+				if (fs.existsSync(resPath)) {
+					const parsed = JSON.parse(fs.readFileSync(resPath, 'utf8')) as { result?: unknown; error?: string };
+					try {
+						fs.unlinkSync(resPath);
+					} catch {
+						// уже снят
+					}
+					try {
+						fs.unlinkSync(reqPath);
+					} catch {
+						// окно с сессией уже удалило запрос
+					}
+					if (parsed.error) {
+						resolve(toolText(parsed.error, true));
+						return;
+					}
+					resolve(parsed.result);
+					return;
+				}
+			} catch {
+				// файл ещё пишется
+			}
+			if (Date.now() >= deadline) {
+				try {
+					fs.unlinkSync(reqPath);
+				} catch {
+					// игнорируем
+				}
+				resolve(undefined);
+				return;
+			}
+			setTimeout(tick, 40);
+		};
+		tick();
+	});
 }
 
 /** DAP-шаг (F10/F11/…), затем ждём обновления снимка стека. */
@@ -139,21 +356,30 @@ function listSourceBreakpoints(): Array<{ file: string; line: number; enabled: b
 async function waitForOnecSession(timeoutMs: number): Promise<boolean> {
 	const deadline = Date.now() + timeoutMs;
 	while (Date.now() < deadline) {
-		if (vscode.debug.activeDebugSession?.type === 'onec') return true;
+		if (getOnecDebugSession()) return true;
 		await sleep(150);
 	}
-	return vscode.debug.activeDebugSession?.type === 'onec';
+	return !!getOnecDebugSession();
 }
 
 async function callTool(name: string, args: Record<string, unknown>): Promise<unknown> {
 	if (name === 'onec_debug_status') {
-		const session = vscode.debug.activeDebugSession;
+		const session = getOnecDebugSession();
 		const snap = getAgentDebugSnapshot();
+		const dbgs = getLastDbgsLaunch();
+		const cfgPort = session?.configuration?.debugServerPort;
 		return toolText(
 			JSON.stringify(
 				{
 					hasOnecSession: session?.type === 'onec',
 					sessionName: session?.name ?? null,
+					mcpBuild: 'owner-3',
+					extensionHostPid: process.pid,
+					debugOwnerPid: readMcpOwner()?.pid ?? null,
+					debugOwnerRoot: readMcpOwner()?.rootProject ?? null,
+					mcpUrl: listenUrl || null,
+					debugServerHost: snap?.debugServerHost ?? dbgs?.debugServer ?? null,
+					debugServerPort: snap?.debugServerPort || dbgs?.port || cfgPort || null,
 					snapshotFile: getAgentDebugSnapshotFile(),
 					launchConfigs: listOnecLaunchConfigNames(),
 					breakpoints: listSourceBreakpoints(),
@@ -221,13 +447,14 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 	}
 	if (name === 'onec_debug_start') {
 		const names = listOnecLaunchConfigNames();
-		if (vscode.debug.activeDebugSession?.type === 'onec') {
+		const running = getOnecDebugSession();
+		if (running) {
 			return toolText(
 				JSON.stringify(
 					{
 						ok: true,
 						alreadyRunning: true,
-						sessionName: vscode.debug.activeDebugSession.name,
+						sessionName: running.name,
 						launchConfigs: names,
 					},
 					null,
@@ -257,7 +484,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 				{
 					ok: ready,
 					configurationName: pick,
-					sessionName: vscode.debug.activeDebugSession?.name ?? null,
+					sessionName: getOnecDebugSession()?.name ?? null,
 					hint: 'Поставьте точку: onec_debug_set_breakpoint. Останов будет после попадания в код.',
 				},
 				null,
@@ -266,8 +493,8 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 		);
 	}
 	if (name === 'onec_debug_stop') {
-		const session = vscode.debug.activeDebugSession;
-		if (!session || session.type !== 'onec') return toolText('Нет активной сессии отладки 1С.', true);
+		const session = getOnecDebugSession();
+		if (!session) return toolText('Нет активной сессии отладки 1С.', true);
 		await vscode.debug.stopDebugging(session);
 		return toolText(JSON.stringify({ ok: true, stopped: session.name }, null, 2));
 	}
@@ -303,7 +530,7 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 					file: resolved,
 					line,
 					breakpoints: listSourceBreakpoints(),
-					hint: vscode.debug.activeDebugSession?.type === 'onec'
+					hint: getOnecDebugSession()
 						? 'Точка передана в адаптер. Вызовите код в 1С или onec_debug_continue, затем onec_debug_stack.'
 						: 'Точка стоит в редакторе. Запустите отладку: onec_debug_start.',
 				},
@@ -319,6 +546,54 @@ async function callTool(name: string, args: Record<string, unknown>): Promise<un
 	if (name === 'onec_debug_step_out') return stepAndWait('stepOut', stepThread);
 	if (name === 'onec_debug_continue') return stepAndWait('continue', stepThread);
 	return toolText(`Неизвестный инструмент: ${name}`, true);
+}
+
+let bridgePumping = false;
+
+/** Окно с сессией onec исполняет запросы, которые положило окно MCP без сессии. */
+async function pumpBridge(): Promise<void> {
+	if (bridgePumping || !getOnecDebugSession() || readMcpOwner()?.pid !== process.pid) return;
+	bridgePumping = true;
+	try {
+		if (!fs.existsSync(BRIDGE_DIR)) return;
+		const files = fs.readdirSync(BRIDGE_DIR).filter((f) => f.startsWith('req-') && f.endsWith('.json'));
+		for (const file of files) {
+			const full = path.join(BRIDGE_DIR, file);
+			let parsed: BridgeRequest;
+			try {
+				parsed = JSON.parse(fs.readFileSync(full, 'utf8')) as BridgeRequest;
+			} catch {
+				continue;
+			}
+			if (!parsed?.id || Date.now() - parsed.createdAt > 20000) {
+				try {
+					fs.unlinkSync(full);
+				} catch {
+					// игнорируем
+				}
+				continue;
+			}
+			const resPath = path.join(BRIDGE_DIR, `res-${parsed.id}.json`);
+			if (fs.existsSync(resPath)) continue;
+			try {
+				const result = await callTool(parsed.name, parsed.args ?? {});
+				fs.writeFileSync(resPath, JSON.stringify({ result }), 'utf8');
+			} catch (e) {
+				fs.writeFileSync(
+					resPath,
+					JSON.stringify({ error: e instanceof Error ? e.message : String(e) }),
+					'utf8',
+				);
+			}
+			try {
+				fs.unlinkSync(full);
+			} catch {
+				// клиент снимет сам
+			}
+		}
+	} finally {
+		bridgePumping = false;
+	}
 }
 
 const TOOLS = [
@@ -447,8 +722,14 @@ async function handleRpc(msg: JsonRpc): Promise<string> {
 	}
 	if (method === 'tools/call') {
 		const p = (msg.params ?? {}) as { name?: string; arguments?: Record<string, unknown> };
+		const toolName = p.name ?? '';
 		try {
-			const result = await callTool(p.name ?? '', p.arguments ?? {});
+			if (foreignDebugOwner()) {
+				const slow = /evaluate|variables|step|continue/.test(toolName);
+				const bridged = await bridgeCall(toolName, p.arguments ?? {}, slow ? 20000 : 2500);
+				if (bridged !== undefined) return jsonRpcResult(id, bridged);
+			}
+			const result = await callTool(toolName, p.arguments ?? {});
 			return jsonRpcResult(id, result);
 		} catch (e) {
 			return jsonRpcResult(id, toolText(e instanceof Error ? e.message : String(e), true));
@@ -471,10 +752,17 @@ function writeJsonRpc(res: http.ServerResponse, body: string): void {
 	res.end(body);
 }
 
-async function handleMcpPost(res: http.ServerResponse, raw: string): Promise<void> {
+async function handleMcpPost(res: http.ServerResponse, raw: string, hop = false): Promise<void> {
 	if (!raw.trim()) {
 		res.writeHead(202).end();
 		return;
+	}
+	if (!hop) {
+		const forwarded = await forwardToDebugOwner(raw);
+		if (forwarded) {
+			writeJsonRpc(res, forwarded);
+			return;
+		}
 	}
 	const parsed = JSON.parse(raw) as JsonRpc | JsonRpc[];
 	const messages = Array.isArray(parsed) ? parsed : [parsed];
@@ -491,7 +779,32 @@ async function handleMcpPost(res: http.ServerResponse, raw: string): Promise<voi
 }
 
 export function startAgentDebugMcp(context: vscode.ExtensionContext): void {
-	server = http.createServer((req, res) => {
+	context.subscriptions.push(
+		vscode.debug.onDidStartDebugSession((session) => {
+			if (session.type !== 'onec') return;
+			trackedOnecSession = session;
+			startSessionBridge();
+		}),
+		vscode.debug.onDidTerminateDebugSession((session) => {
+			if (trackedOnecSession?.id === session.id) {
+				trackedOnecSession = undefined;
+				clearMcpOwnerFile();
+			}
+		}),
+		vscode.debug.onDidChangeActiveDebugSession((session) => {
+			if (session?.type === 'onec') trackedOnecSession = session;
+		}),
+	);
+	const already = vscode.debug.activeDebugSession;
+	if (already?.type === 'onec') trackedOnecSession = already;
+	const bridgePump = setInterval(() => {
+		void pumpBridge();
+	}, 80);
+	context.subscriptions.push({
+		dispose: () => clearInterval(bridgePump),
+	});
+
+	const onMcpRequest: http.RequestListener = (req, res) => {
 		const urlPath = (req.url ?? '/').split('?')[0];
 		if (urlPath.includes('well-known') || urlPath.includes('oauth')) {
 			res.writeHead(404).end();
@@ -523,9 +836,10 @@ export function startAgentDebugMcp(context: vscode.ExtensionContext): void {
 		const chunks: Buffer[] = [];
 		req.on('data', (c) => chunks.push(c as Buffer));
 		req.on('end', () => {
+			const hop = req.headers['x-debug-mcp-hop'] === '1';
 			void (async () => {
 				try {
-					await handleMcpPost(res, Buffer.concat(chunks).toString('utf8'));
+					await handleMcpPost(res, Buffer.concat(chunks).toString('utf8'), hop);
 				} catch (e) {
 					if (!res.headersSent) {
 						res.writeHead(400, { 'Content-Type': 'application/json' });
@@ -534,25 +848,48 @@ export function startAgentDebugMcp(context: vscode.ExtensionContext): void {
 				}
 			})();
 		});
-	});
-	const afterListen = (): void => {
-		listenUrl = `http://127.0.0.1:${MCP_PORT}/mcp`;
-		const cursorMcp = (
-			vscode as unknown as { cursor?: { mcp?: { registerServer: (c: unknown) => void } } }
-		).cursor?.mcp;
-		try {
-			cursorMcp?.registerServer?.({
-				name: SERVER_NAME,
-				server: { url: listenUrl },
-			});
-		} catch {
-			// не Cursor
-		}
 	};
-	server.on('error', (err: NodeJS.ErrnoException) => {
-		if (err.code === 'EADDRINUSE') afterListen();
-	});
-	server.listen(MCP_PORT, '127.0.0.1', afterListen);
+	function startSessionBridge(): void {
+		if (sessionBridge) {
+			writeMcpOwnerFile();
+			registerCursorMcp();
+			return;
+		}
+		const bridge = http.createServer(onMcpRequest);
+		sessionBridge = bridge;
+		bridge.on('error', () => {
+			// 18790 занят другим окном: владелец будет доступен по основному порту этого окна.
+			sessionBridge = undefined;
+			writeMcpOwnerFile();
+		});
+		bridge.listen(SESSION_BRIDGE_PORT, '127.0.0.1', () => {
+			sessionBridgeUrl = `http://127.0.0.1:${SESSION_BRIDGE_PORT}/mcp`;
+			writeMcpOwnerFile();
+			registerCursorMcp();
+		});
+		writeMcpOwnerFile();
+	}
+
+	armDebugBridge = startSessionBridge;
+
+	if (getOnecDebugSession()) startSessionBridge();
+
+	const attachListen = (port: number): void => {
+		server = http.createServer(onMcpRequest);
+		server.on('error', (err: NodeJS.ErrnoException) => {
+			// Занятый порт — это другое окно. Не регистрируем его URL, слушаем следующий.
+			if (err.code === 'EADDRINUSE' && port < MCP_PORT + 4) {
+				attachListen(port + 1);
+			}
+		});
+		server.listen(port, '127.0.0.1', () => {
+			listenUrl = `http://127.0.0.1:${port}/mcp`;
+			registerCursorMcp();
+			// Файл владельца пишет только окно с сессией, иначе чужой MCP затирает адрес.
+			if (pendingDebugEndpoint || getOnecDebugSession()) writeMcpOwnerFile();
+		});
+	};
+	attachListen(MCP_PORT);
 	context.subscriptions.push({ dispose: stopAgentDebugMcp });
 }
 
@@ -569,4 +906,10 @@ export function stopAgentDebugMcp(): void {
 		server.close();
 		server = undefined;
 	}
+	if (sessionBridge) {
+		sessionBridge.close();
+		sessionBridge = undefined;
+		sessionBridgeUrl = '';
+	}
+	clearMcpOwnerFile();
 }

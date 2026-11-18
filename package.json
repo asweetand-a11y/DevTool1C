@@ -2,7 +2,7 @@
   "name": "1c-dev-tools",
   "displayName": "1C Dev Tools",
   "description": "Расширение для Cursor с инструментами разработки для экосистемы 1С. Предоставляет удобный интерфейс для работы с проектами 1С, включая разбор обработок, отчетов и конфигураций.",
-  "version": "2.10.11",
+  "version": "2.10.16",
   "publisher": "whiterabbit",
   "repository": {
     "type": "git",
@@ -41,15 +41,26 @@
   ],
   "main": "./dist/extension.js",
   "contributes": {
+    "languages": [
+      {
+        "id": "bsl",
+        "aliases": ["BSL", "1C (BSL)"],
+        "extensions": [".bsl"]
+      }
+    ],
     "breakpoints": [
       {
         "language": "bsl"
+      },
+      {
+        "language": "1c"
       }
     ],
     "debuggers": [
       {
         "type": "onec",
         "label": "1C:Enterprise",
+        "languages": ["bsl", "1c"],
         "configurationAttributes": {
           "launch": {
             "required": [],

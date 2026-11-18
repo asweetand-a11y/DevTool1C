@@ -29,6 +29,9 @@ export interface AgentDebugSnapshot {
 	attached: boolean;
 	rootProject: string;
 	snapshotFile: string;
+	/** Фактический адрес dbgs этой сессии. */
+	debugServerHost?: string;
+	debugServerPort?: number;
 	threads: Array<{ id: number; label: string }>;
 	frames: AgentDebugFrame[];
 }
@@ -42,9 +45,17 @@ export function getAgentDebugSnapshotFile(): string {
 	return SNAPSHOT_FILE;
 }
 
-/** Последний снимок или null, если сессии нет / ещё не было останова. */
+/** Последний снимок этого процесса или записанный на диск другим окном Cursor. */
 export function getAgentDebugSnapshot(): AgentDebugSnapshot | null {
-	return current;
+	if (current) return current;
+	try {
+		if (!fs.existsSync(SNAPSHOT_FILE)) return null;
+		const parsed = JSON.parse(fs.readFileSync(SNAPSHOT_FILE, 'utf8')) as AgentDebugSnapshot;
+		if (!parsed || !Array.isArray(parsed.frames)) return null;
+		return parsed;
+	} catch {
+		return null;
+	}
 }
 
 /** Сбрасывает снимок при отключении отладки. */
@@ -94,6 +105,8 @@ export function publishAgentDebugSnapshot(args: {
 	rootProject: string;
 	targets: Array<{ userName?: string; targetType?: string }>;
 	stacks: Map<number, StackItemViewInfoData[]>;
+	debugServerHost?: string;
+	debugServerPort?: number;
 }): void {
 	const frames: AgentDebugFrame[] = [];
 	const threads: AgentDebugSnapshot['threads'] = [];
@@ -120,6 +133,8 @@ export function publishAgentDebugSnapshot(args: {
 		attached: args.attached,
 		rootProject: root,
 		snapshotFile: SNAPSHOT_FILE,
+		debugServerHost: args.debugServerHost,
+		debugServerPort: args.debugServerPort,
 		threads,
 		frames,
 	};
