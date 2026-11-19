@@ -2,6 +2,7 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as vscode from 'vscode';
 import { VRunnerManager } from '../vrunnerManager';
+import { buildCommand } from '../utils/commandUtils';
 import { BaseCommand } from './baseCommand';
 import {
 	getLoadConfigurationFromSrcCommandName,
@@ -97,20 +98,7 @@ export class ConfigurationCommands extends BaseCommand {
 			cwd: workspaceRoot
 		});
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		terminal.sendText(command);
 		terminal.show();
@@ -323,20 +311,7 @@ export class ConfigurationCommands extends BaseCommand {
 		const loadLogFile = path.join(logDir, `load_${VRunnerManager.formatDesignerLoadLogTimestamp()}.log`);
 		args.push('--out', loadLogFile);
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		// Определяем тип оболочки для правильного удаления файла
 		const { detectShellType, joinCommands } = await import('../utils/commandUtils.js');
@@ -422,20 +397,7 @@ export class ConfigurationCommands extends BaseCommand {
 			cwd: workspaceRoot
 		});
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		terminal.sendText(command);
 		terminal.show();
@@ -498,20 +460,7 @@ export class ConfigurationCommands extends BaseCommand {
 			cwd: workspaceRoot
 		});
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		terminal.sendText(command);
 		terminal.show();
@@ -571,20 +520,7 @@ export class ConfigurationCommands extends BaseCommand {
 			cwd: workspaceRoot
 		});
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		terminal.sendText(command);
 		terminal.show();
@@ -645,20 +581,7 @@ export class ConfigurationCommands extends BaseCommand {
 			cwd: workspaceRoot
 		});
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		terminal.sendText(command);
 		terminal.show();
@@ -741,17 +664,7 @@ export class ConfigurationCommands extends BaseCommand {
 			'--src', absoluteSrcPath
 		];
 
-		const escapedLoadArgs = loadArgs.map(arg => {
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-
-		const loadCommand = `${onescriptPath} ${escapedLoadArgs.join(' ')}`;
+		const loadCommand = buildCommand(onescriptPath, loadArgs);
 
 		// Шаг 2: Выгрузить конфигурацию в файл .cf
 		const dumpArgs = [
@@ -763,17 +676,7 @@ export class ConfigurationCommands extends BaseCommand {
 			'--file', outputPath
 		];
 
-		const escapedDumpArgs = dumpArgs.map(arg => {
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-
-		const dumpCommand = `${onescriptPath} ${escapedDumpArgs.join(' ')}`;
+		const dumpCommand = buildCommand(onescriptPath, dumpArgs);
 
 		// Объединяем команды
 		const combinedCommand = joinCommands([loadCommand, dumpCommand], shellType);
@@ -843,17 +746,7 @@ export class ConfigurationCommands extends BaseCommand {
 			'--file', inputPath
 		];
 
-		const escapedLoadArgs = loadArgs.map(arg => {
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-
-		const loadCommand = `${onescriptPath} ${escapedLoadArgs.join(' ')}`;
+		const loadCommand = buildCommand(onescriptPath, loadArgs);
 
 		// Шаг 2: Выгрузить конфигурацию в исходники
 		const dumpArgs = [
@@ -865,17 +758,7 @@ export class ConfigurationCommands extends BaseCommand {
 			'--out', absoluteSrcPath
 		];
 
-		const escapedDumpArgs = dumpArgs.map(arg => {
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-
-		const dumpCommand = `${onescriptPath} ${escapedDumpArgs.join(' ')}`;
+		const dumpCommand = buildCommand(onescriptPath, dumpArgs);
 
 		// Объединяем команды
 		const combinedCommand = joinCommands([loadCommand, dumpCommand], shellType);

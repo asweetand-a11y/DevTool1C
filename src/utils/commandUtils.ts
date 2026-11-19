@@ -104,14 +104,14 @@ function detectShellFromVSCodeWindows(): ShellType | undefined {
 /**
  * Определяет тип оболочки из переменных окружения для Windows
  * 
- * Проверяет переменные окружения:
- * - SHELL - указывает на bash оболочки (Git Bash, WSL, Cygwin)
- * - COMSPEC - указывает на cmd.exe
- * 
+ * Проверяет переменную окружения SHELL (Git Bash, WSL, Cygwin).
+ * COMSPEC не используется: на Windows он почти всегда указывает на cmd.exe,
+ * даже когда терминал Cursor — PowerShell. Иначе команда собирается синтаксисом cmd
+ * и PowerShell сообщает о непредвиденной лексеме.
+ *
  * @returns Тип оболочки или undefined, если не удалось определить
  */
 function detectShellFromEnvWindows(): ShellType | undefined {
-	// SHELL указывает на bash оболочки (Git Bash, WSL, Cygwin)
 	if (process.env.SHELL) {
 		const shell = process.env.SHELL.toLowerCase();
 		if (shell.includes('bash')) {
@@ -119,13 +119,6 @@ function detectShellFromEnvWindows(): ShellType | undefined {
 		}
 		if (shell.includes('zsh')) {
 			return 'zsh';
-		}
-	}
-	// COMSPEC указывает на cmd.exe
-	if (process.env.COMSPEC) {
-		const comspec = process.env.COMSPEC.toLowerCase();
-		if (comspec.includes('cmd.exe')) {
-			return 'cmd';
 		}
 	}
 	return undefined;
@@ -233,6 +226,10 @@ export function detectShellType(): ShellType {
  * escapeArgForPowerShell('command1;command2') // "'command1;command2'"
  */
 function escapeArgForPowerShell(arg: string): string {
+	// Пустой пароль иначе склеивается со следующим аргументом: --db-pwd --out
+	if (arg.length === 0) {
+		return "''";
+	}
 	// Экранируем аргументы, содержащие пробелы, $, обратные кавычки или точку с запятой
 	// Точка с запятой - это разделитель команд в PowerShell, поэтому её нужно экранировать
 	if (arg.includes(' ') || arg.includes('$') || arg.includes('`') || arg.includes(';')) {
@@ -250,6 +247,9 @@ function escapeArgForPowerShell(arg: string): string {
  * @returns Экранированный аргумент (в двойных кавычках, если содержит пробелы)
  */
 function escapeArgForCmdBash(arg: string): string {
+	if (arg.length === 0) {
+		return '""';
+	}
 	if (arg.includes(' ') && !arg.startsWith('"') && !arg.startsWith("'")) {
 		return `"${arg}"`;
 	}
@@ -386,7 +386,7 @@ function getEncodingPrefix(shellType: ShellType): string {
  * ```typescript
  * // В PowerShell
  * buildCommand('vrunner.bat', ['init-dev', '--ibconnection', '/F./build/ib'], 'powershell')
- * // Вернет: '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; vrunner.bat init-dev --ibconnection /F./build/ib'
+ * // Вернет: '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; & vrunner.bat init-dev --ibconnection /F./build/ib'
  * 
  * // В Git Bash на Windows
  * buildCommand('oscript_modules\\bin\\vrunner.bat', ['init-dev'], 'bash')
@@ -399,8 +399,10 @@ export function buildCommand(executablePath: string, args: string[], shellType?:
 	const quotedPath = normalizedPath.includes(' ') ? `"${normalizedPath}"` : normalizedPath;
 	const argsString = escapeCommandArgs(args, shell);
 	const encodingPrefix = getEncodingPrefix(shell);
-	
-	return `${encodingPrefix}${quotedPath} ${argsString}`;
+	// В PowerShell кавычки вокруг пути с пробелами — это строка, а не вызов. Нужен оператор вызова &.
+	const invocation = shell === 'powershell' ? `& ${quotedPath}` : quotedPath;
+
+	return `${encodingPrefix}${invocation} ${argsString}`;
 }
 
 /**

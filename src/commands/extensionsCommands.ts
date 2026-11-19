@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { VRunnerManager } from '../vrunnerManager';
+import { buildCommand } from '../utils/commandUtils';
 import { BaseCommand } from './baseCommand';
 import {
 	getLoadExtensionFromSrcCommandName,
@@ -316,18 +317,7 @@ export class ExtensionsCommands extends BaseCommand {
 				'--out', loadLogFile
 			];
 
-			// Формируем команду с экранированием аргументов
-			const escapedArgs = args.map(arg => {
-				if (arg.includes(' ')) {
-					return `"${arg}"`;
-				}
-				if (arg === '') {
-					return '""';
-				}
-				return arg;
-			});
-
-			const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+			const command = buildCommand(onescriptPath, args);
 			commands.push(command);
 		}
 
@@ -446,18 +436,7 @@ export class ExtensionsCommands extends BaseCommand {
 				'--extension', extensionName
 			];
 
-			// Формируем команду с экранированием аргументов
-			const escapedArgs = args.map(arg => {
-				if (arg.includes(' ')) {
-					return `"${arg}"`;
-				}
-				if (arg === '') {
-					return '""';
-				}
-				return arg;
-			});
-
-			const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+			const command = buildCommand(onescriptPath, args);
 			commands.push(command);
 		}
 
@@ -569,20 +548,7 @@ export class ExtensionsCommands extends BaseCommand {
 			cwd: workspaceRoot
 		});
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		terminal.sendText(command);
 		terminal.show();
@@ -668,20 +634,7 @@ export class ExtensionsCommands extends BaseCommand {
 			cwd: workspaceRoot
 		});
 		
-		// Формируем команду с экранированием аргументов
-		const escapedArgs = args.map(arg => {
-			// Если аргумент содержит пробелы, обрамляем кавычками
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			// Если аргумент пустой, передаём пустые кавычки
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-		
-		const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+		const command = buildCommand(onescriptPath, args);
 		
 		terminal.sendText(command);
 		terminal.show();
@@ -826,18 +779,7 @@ export class ExtensionsCommands extends BaseCommand {
 				'--out', loadLogFile
 			];
 
-			// Формируем команду с экранированием аргументов
-			const escapedArgs = args.map(arg => {
-				if (arg.includes(' ')) {
-					return `"${arg}"`;
-				}
-				if (arg === '') {
-					return '""';
-				}
-				return arg;
-			});
-
-			const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+			const command = buildCommand(onescriptPath, args);
 			commands.push(command);
 
 			// Добавляем команду удаления временного файла после загрузки
@@ -863,17 +805,7 @@ export class ExtensionsCommands extends BaseCommand {
 			'--db-pwd', ibParams.password
 		];
 
-		const escapedUpdateDbArgs = updateDbArgs.map(arg => {
-			if (arg.includes(' ')) {
-				return `"${arg}"`;
-			}
-			if (arg === '') {
-				return '""';
-			}
-			return arg;
-		});
-
-		const updateDbCommand = `${onescriptPath} ${escapedUpdateDbArgs.join(' ')}`;
+		const updateDbCommand = buildCommand(onescriptPath, updateDbArgs);
 		commands.push(updateDbCommand);
 
 		// Удаляем префиксы кодировки из всех команд кроме первой
@@ -994,18 +926,7 @@ export class ExtensionsCommands extends BaseCommand {
 				'--extension', extensionFolder
 			];
 
-			// Формируем команду с экранированием аргументов
-			const escapedArgs = args.map(arg => {
-				if (arg.includes(' ')) {
-					return `"${arg}"`;
-				}
-				if (arg === '') {
-					return '""';
-				}
-				return arg;
-			});
-
-			const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+			const command = buildCommand(onescriptPath, args);
 			commands.push(command);
 		}
 
@@ -1140,18 +1061,7 @@ export class ExtensionsCommands extends BaseCommand {
 				'--extension', extensionFolder
 			];
 
-			// Формируем команду с экранированием аргументов
-			const escapedArgs = args.map(arg => {
-				if (arg.includes(' ')) {
-					return `"${arg}"`;
-				}
-				if (arg === '') {
-					return '""';
-				}
-				return arg;
-			});
-
-			const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+			const command = buildCommand(onescriptPath, args);
 			commands.push(command);
 		}
 
@@ -1274,18 +1184,7 @@ export class ExtensionsCommands extends BaseCommand {
 				'--extension', extensionName
 			];
 
-			// Формируем команду с экранированием аргументов
-			const escapedArgs = args.map(arg => {
-				if (arg.includes(' ')) {
-					return `"${arg}"`;
-				}
-				if (arg === '') {
-					return '""';
-				}
-				return arg;
-			});
-
-			const command = `${onescriptPath} ${escapedArgs.join(' ')}`;
+			const command = buildCommand(onescriptPath, args);
 			commands.push(command);
 		}
 

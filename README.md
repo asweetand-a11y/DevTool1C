@@ -60,6 +60,7 @@
 - Cursor IDE
 - Node.js версии 18.x или выше
 - OneScript (oscript) - для выполнения скриптов. Ссылка [https://oscript.io/](https://oscript.io/)
+- Обновить Windows powershell 7.0
 
 
 

@@ -607,6 +607,81 @@ export class VRunnerManager {
 	}
 
 	/**
+	 * Разбирает текст env.json.
+	 * Одинарный обратный слэш в строке подключения (/S server\base)
+	 * делает файл невалидным JSON. Такие слэши удваиваются, иначе разбор
+	 * падает и команды молча получают подключение /F./build/ib.
+	 * @param content — содержимое env.json
+	 * @returns Разобранный объект
+	 */
+	private parseEnvJsonContent(content: string): any {
+		const text = content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
+		try {
+			return JSON.parse(text);
+		} catch {
+			return JSON.parse(this.repairUnescapedJsonBackslashes(text));
+		}
+	}
+
+	/**
+	 * Удваивает обратные слэши внутри JSON-строк, если они не являются допустимым экранированием.
+	 * Допустимые пары (\\, \", \/, \b, \f, \n, \r, \t, \uXXXX) не меняются.
+	 * @param text — исходный текст JSON
+	 * @returns Текст, пригодный для JSON.parse
+	 */
+	private repairUnescapedJsonBackslashes(text: string): string {
+		let result = '';
+		let inString = false;
+
+		for (let i = 0; i < text.length; i++) {
+			const ch = text[i];
+			if (!inString) {
+				result += ch;
+				if (ch === '"') {
+					inString = true;
+				}
+				continue;
+			}
+
+			if (ch === '"') {
+				inString = false;
+				result += ch;
+				continue;
+			}
+
+			if (ch !== '\\') {
+				result += ch;
+				continue;
+			}
+
+			const next = text[i + 1];
+			if (next === undefined) {
+				result += '\\\\';
+				continue;
+			}
+
+			if (next === 'u') {
+				const hex = text.slice(i + 2, i + 6);
+				if (/^[0-9a-fA-F]{4}$/.test(hex)) {
+					result += text.slice(i, i + 6);
+					i += 5;
+					continue;
+				}
+			}
+
+			if (next === '"' || next === '\\' || next === '/' || next === 'b' || next === 'f' || next === 'n' || next === 'r' || next === 't') {
+				result += ch + next;
+				i += 1;
+				continue;
+			}
+
+			result += '\\\\';
+		}
+
+		return result;
+	}
+
+	/**
 	 * Читает и парсит env.json из корня workspace
 	 * 
 	 * Файл env.json используется для хранения параметров подключения к ИБ
@@ -629,8 +704,14 @@ export class VRunnerManager {
 		const envPath = path.join(this.workspaceRoot, 'env.json');
 		try {
 			const content = await fs.readFile(envPath, 'utf8');
-			return JSON.parse(content);
-		} catch {
+			return this.parseEnvJsonContent(content);
+		} catch (error) {
+			const code = (error as NodeJS.ErrnoException).code;
+			if (code !== 'ENOENT') {
+				void vscode.window.showWarningMessage(
+					'Не удалось прочитать env.json, для запуска используется /F./build/ib. Проверьте JSON: обратный слэш в строке нужно писать как \\\\'
+				);
+			}
 			return {};
 		}
 	}
@@ -706,7 +787,7 @@ export class VRunnerManager {
 
 			try {
 				const content = await fs.readFile(absoluteSettingsPath, 'utf8');
-				const env = JSON.parse(content);
+				const env = this.parseEnvJsonContent(content);
 				
 				if (env.default && typeof env.default['--ibconnection'] === 'string') {
 					return ['--ibconnection', env.default['--ibconnection']];
