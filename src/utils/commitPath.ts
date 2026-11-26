@@ -1,5 +1,5 @@
 /**
- * Нормализация путей из Commit.txt для частичной загрузки конфигурации/расширения.
+ * Нормализация путей из commit_devtools.txt для частичной загрузки конфигурации/расширения.
  *
  * Агент может записать абсолютный путь, путь от корня проекта, путь от src/cf,
  * путь от другого диска с фрагментом src/cf, или путь от корня выгрузки XML
@@ -13,7 +13,7 @@ import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 /**
- * Откуда распознан путь в строке Commit.txt.
+ * Откуда распознан путь в строке commit_devtools.txt.
  * - cf — явно из основной конфигурации (маркер src/cf или настроенный paths.src)
  * - cfe — явно из расширения (маркер src/cfe/<имя>)
  * - dump — путь уже относительно корня XML-выгрузки, без src/cf и src/cfe
@@ -21,7 +21,7 @@ import { fileURLToPath } from 'node:url';
 export type CommitPathKind = 'cf' | 'cfe' | 'dump';
 
 /**
- * Разобранная строка Commit.txt.
+ * Разобранная строка commit_devtools.txt.
  */
 export interface ParsedCommitPath {
 	kind: CommitPathKind;
@@ -44,7 +44,7 @@ const FALLBACK_CF_MARKER = 'src/cf';
 const FALLBACK_CFE_MARKER = 'src/cfe';
 
 /**
- * Разбирает одну строку Commit.txt.
+ * Разбирает одну строку commit_devtools.txt.
  * @param rawLine - Исходная строка файла
  * @param context - Корень workspace и пути src/cfe
  * @returns Разобранный путь или undefined, если строку нужно пропустить
@@ -131,7 +131,7 @@ export function parseCommitPathLine(rawLine: string, context: CommitPathContext)
 /**
  * Преобразует относительный POSIX-путь в формат -listFile Конфигуратора (обратные слэши).
  * @param relativePath - Путь относительно каталога выгрузки
- * @returns Строка для записи во временный Commit_*.txt
+ * @returns Строка для записи во временный commit_devtools_*.txt
  */
 export function toDesignerListFilePath(relativePath: string): string {
 	return relativePath.replace(/\//g, '\\');
@@ -139,7 +139,7 @@ export function toDesignerListFilePath(relativePath: string): string {
 
 
 /**
- * Убирает BOM, кавычки и комментарии из строки Commit.txt.
+ * Убирает BOM, кавычки и комментарии из строки commit_devtools.txt.
  */
 function cleanCommitLine(line: string): string | undefined {
 	let value = line.replace(/^\uFEFF/, '').trim();

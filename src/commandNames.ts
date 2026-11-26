@@ -240,11 +240,11 @@ export function getLoadConfigurationFromSrcCommandName(mode: 'init' | 'update' =
 }
 
 /**
- * Получить название и заголовок для команды обновления конфигурации из src/cf с использованием Commit.txt
+ * Получить название и заголовок для команды обновления конфигурации из src/cf с использованием commit_devtools.txt
  */
 export function getUpdateConfigurationFromSrcWithCommitCommandName(): CommandNameAndTitle {
 	return {
-		name: 'Обновление конфигурации с Commit.txt',
+		name: 'Обновление конфигурации с commit_devtools.txt',
 		title: 'Обновить конфигурацию из src/cf'
 	};
 }
@@ -344,7 +344,7 @@ export function getDumpUpdateExtensionToSrcCommandName(): CommandNameAndTitle {
 }
 
 /**
- * Получить название и заголовок для команды обновления расширений из src/cfe с использованием Commit.txt
+ * Получить название и заголовок для команды обновления расширений из src/cfe с использованием commit_devtools.txt
  */
 export function getUpdateExtensionFromSrcWithCommitCommandName(): CommandNameAndTitle {
 	return {

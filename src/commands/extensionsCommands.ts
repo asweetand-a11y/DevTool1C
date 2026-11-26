@@ -32,13 +32,13 @@ export class ExtensionsCommands extends BaseCommand {
 	 * @returns Промис, который разрешается массивом имен папок расширений или undefined при ошибке
 	 */
 	/**
-	 * Фильтрует строки из Commit.txt для указанного расширения и приводит пути к формату -listFile
+	 * Фильтрует строки из commit_devtools.txt для указанного расширения и приводит пути к формату -listFile
 	 * (относительно src/cfe/<имя>), учитывая абсолютные, относительные и «от корня выгрузки» варианты.
 	 * 
 	 * Путь к файлу расширения должен содержать подстроку `src/cfe/<ИмяРасширения>/`.
 	 * Пути могут быть относительными (от workspace root) или абсолютными.
 	 * 
-	 * @param commitPath - Путь к исходному файлу Commit.txt
+	 * @param commitPath - Путь к исходному файлу commit_devtools.txt
 	 * @param extensionName - Имя расширения
 	 * @param workspaceRoot - Корневая директория workspace
 	 * @returns Путь к временному файлу с отфильтрованными строками
@@ -55,7 +55,7 @@ export class ExtensionsCommands extends BaseCommand {
 		try {
 			commitContent = await fs.readFile(commitPath, 'utf-8');
 		} catch (error) {
-			throw new Error(`Не удалось прочитать файл Commit.txt: ${(error as Error).message}`);
+			throw new Error(`Не удалось прочитать файл commit_devtools.txt: ${(error as Error).message}`);
 		}
 
 		const context = {
@@ -86,15 +86,15 @@ export class ExtensionsCommands extends BaseCommand {
 			filteredLines.push(listPath);
 		}
 
-		const buildCommitDir = path.join(workspaceRoot, 'build', 'commit');
+		const buildCommitDir = path.join(workspaceRoot, 'build', 'commit_devtools');
 
 		try {
 			await fs.mkdir(buildCommitDir, { recursive: true });
 		} catch (error) {
-			throw new Error(`Не удалось создать папку build/commit: ${(error as Error).message}`);
+			throw new Error(`Не удалось создать папку build/commit_devtools: ${(error as Error).message}`);
 		}
 
-		const tempFileName = `Commit_${extensionName}.txt`;
+		const tempFileName = `commit_devtools_${extensionName}.txt`;
 		const tempFilePath = path.join(buildCommitDir, tempFileName);
 
 		try {
@@ -641,10 +641,10 @@ export class ExtensionsCommands extends BaseCommand {
 	}
 
 	/**
-	 * Обновляет расширения из исходников с использованием файла Commit.txt
+	 * Обновляет расширения из исходников с использованием файла commit_devtools.txt
 	 * 
 	 * Находит все папки расширений в src/cfe (содержащие Configuration.xml) и для каждой:
-	 * 1. Создает временный файл Commit_<ИмяРасширения>.txt с отфильтрованными строками из Commit.txt
+	 * 1. Создает временный файл commit_devtools_<ИмяРасширения>.txt с отфильтрованными строками из commit_devtools.txt
 	 * 2. Выполняет команду загрузки расширения через vrunner run --command
 	 * 3. Удаляет временный файл
 	 * 
@@ -654,10 +654,10 @@ export class ExtensionsCommands extends BaseCommand {
 	 * @returns Промис, который разрешается после запуска команд
 	 */
 	/**
-	 * Обновляет расширения из исходников с использованием файла Commit.txt
+	 * Обновляет расширения из исходников с использованием файла commit_devtools.txt
 	 * 
 	 * Находит все папки расширений в src/cfe (содержащие Configuration.xml) и для каждой:
-	 * 1. Создает временный файл Commit_<ИмяРасширения>.txt с отфильтрованными строками из Commit.txt
+	 * 1. Создает временный файл commit_devtools_<ИмяРасширения>.txt с отфильтрованными строками из commit_devtools.txt
 	 * 2. Выполняет команду загрузки расширения через v8runner-cli.os
 	 * 3. Удаляет временный файл
 	 * 
@@ -742,7 +742,7 @@ export class ExtensionsCommands extends BaseCommand {
 				tempFiles.push(tempCommitPath);
 			} catch (error) {
 				vscode.window.showErrorMessage(
-					`Ошибка при фильтрации Commit.txt для расширения ${extensionFolder}: ${(error as Error).message}`
+					`Ошибка при фильтрации commit_devtools.txt для расширения ${extensionFolder}: ${(error as Error).message}`
 				);
 				// Удаляем уже созданные временные файлы
 				for (const tempFile of tempFiles) {

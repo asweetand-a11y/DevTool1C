@@ -174,16 +174,16 @@ export class VRunnerManager {
 	}
 
 	/**
-	 * Получает путь к файлу Commit.txt из настроек
-	 * @returns Путь к файлу Commit.txt
+	 * Получает путь к файлу commit_devtools.txt из настроек
+	 * @returns Путь к файлу commit_devtools.txt
 	 */
 	/**
-	 * Получает путь к файлу Commit.txt из настроек
-	 * @returns Путь к файлу Commit.txt
+	 * Получает путь к файлу commit_devtools.txt из настроек
+	 * @returns Путь к файлу commit_devtools.txt
 	 */
 	public getCommitPath(): string {
 		const config = vscode.workspace.getConfiguration('1c-dev-tools');
-		let commitPath = config.get<string>('paths.commit', '${workspaceFolder}\\build\\commit\\commit.txt');
+		let commitPath = config.get<string>('paths.commit', '${workspaceFolder}\\build\\commit_devtools\\commit_devtools.txt');
 		
 		// Разворачиваем переменную ${workspaceFolder}
 		if (commitPath.includes('${workspaceFolder}')) {
